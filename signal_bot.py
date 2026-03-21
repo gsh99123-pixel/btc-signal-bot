@@ -3,7 +3,7 @@
 BTC 선물 시그널 봇 v6 (B-Final)
 FVG + OB + 거래량 + HTF 필터 + 펀딩비 필터
 + 모멘텀 필터 + 켈리식 리스크 + 월간손실한도
-데이터: Binance Futures API (fapi.binance.com)
+데이터: Bybit API (api.bybit.com) - 한국 접근 가능
 """
 
 import time, datetime, requests
@@ -16,13 +16,14 @@ TELEGRAM_TOKEN   = "8617006078:AAEarZfA75pQBZpKgJegbztO9XuHhUJCeR0"
 TELEGRAM_CHAT_ID = "8285816381"
 
 SYMBOL         = "BTCUSDT"
-TIMEFRAMES     = ["1h", "2h", "4h"]   # 15m 제외
-HTF            = "4h"
+TIMEFRAMES     = ["60", "120", "240"]  # Bybit: 분 단위
+TF_LABEL       = {"60":"1h","120":"2h","240":"4h"}
+HTF            = "240"
 CHECK_INTERVAL = 60
 
 # ── 시그널 조건
-MIN_SCORE_DUAL   = 7     # OB+FVG 둘 다 있을 때
-MIN_SCORE_SINGLE = 8     # 하나만 있을 때
+MIN_SCORE_DUAL   = 7
+MIN_SCORE_SINGLE = 8
 MIN_RR           = 1.8
 ATR_TP_MULT      = 2.5
 ATR_SL_MULT      = 1.5
@@ -34,32 +35,32 @@ VOL_WINDOW       = 10
 FUNDING_LONG_BLOCK  =  0.0005
 FUNDING_SHORT_BLOCK = -0.0005
 
-# ── 리스크 관리 (시드 1500 USDT 기준)
+# ── 리스크 관리
 TOTAL_SEED           = 1500.0
-RISK_BASE            = 0.015   # 기본 1.5%
-RISK_HIGH            = 0.020   # 연속 WIN 2회+ → 2.0%
-RISK_LOW             = 0.010   # 연속 LOSE 2회+ → 1.0%
+RISK_BASE            = 0.015
+RISK_HIGH            = 0.020
+RISK_LOW             = 0.010
 MIN_LEV              = 5
 MAX_LEV              = 15
 
 # ── 손실 한도
-DAILY_MAX_LOSS_PCT   = 0.05    # 일일 5%
-MONTHLY_MAX_LOSS_PCT = 0.15    # 월간 15%
+DAILY_MAX_LOSS_PCT   = 0.05
+MONTHLY_MAX_LOSS_PCT = 0.15
 
 # ── 쿨다운
-BASE_COOLDOWN     = 2 * 3600   # 2시간 (초)
-MAX_COOLDOWN      = 8 * 3600   # 최대 8시간
-COOLDOWN_MULT     = 1.5        # LOSE 시 1.5배
-CONSEC_LOSE_LIMIT = 4          # 4연속 LOSE → 당일 방향 중단
+BASE_COOLDOWN     = 2 * 3600
+MAX_COOLDOWN      = 8 * 3600
+COOLDOWN_MULT     = 1.5
+CONSEC_LOSE_LIMIT = 4
 
-BASE = "https://fapi.binance.com"
+BASE = "https://api.bybit.com"
 
 # ═══════════════════════════════════════
 # 텔레그램
 # ═══════════════════════════════════════
 def send_telegram(msg):
     url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
+    data = {"chat_id":TELEGRAM_CHAT_ID,"text":msg,"parse_mode":"HTML"}
     try:
         r = requests.post(url, data=data, timeout=10)
         return r.status_code == 200
@@ -68,40 +69,71 @@ def send_telegram(msg):
         return False
 
 # ═══════════════════════════════════════
-# Binance Futures API
+# Bybit API
 # ═══════════════════════════════════════
-def get_klines(interval, limit=100):
-    r = requests.get(f"{BASE}/fapi/v1/klines",
-                     params={"symbol":SYMBOL,"interval":interval,"limit":limit},
-                     timeout=10)
+def get_klines(interval, limit=200):
+    """Bybit 선물 캔들 데이터"""
+    r = requests.get(f"{BASE}/v5/market/kline", params={
+        "category":"linear","symbol":SYMBOL,
+        "interval":interval,"limit":limit
+    }, timeout=10)
     r.raise_for_status()
-    return [{
-        "open":float(k[1]),"high":float(k[2]),
-        "low":float(k[3]),"close":float(k[4]),
-        "volume":float(k[5]),"buy_vol":float(k[9]),
-        "sell_vol":float(k[5])-float(k[9]),
-        "bull":float(k[4])>=float(k[1])
-    } for k in r.json()]
+    d = r.json()
+    if d.get("retCode") != 0:
+        raise Exception(f"Bybit 오류: {d.get('retMsg')}")
+    candles = []
+    for k in reversed(d["result"]["list"]):
+        # Bybit 순서: [timestamp, open, high, low, close, volume, turnover]
+        o=float(k[1]); h=float(k[2]); l=float(k[3]); c=float(k[4]); v=float(k[5])
+        bull = c >= o
+        # Bybit는 taker buy/sell 분리 없음 → 상승봉=매수, 하락봉=매도로 근사
+        buy_vol  = v if bull else 0.0
+        sell_vol = 0.0 if bull else v
+        candles.append({
+            "open":o,"high":h,"low":l,"close":c,
+            "volume":v,"buy_vol":buy_vol,"sell_vol":sell_vol,"bull":bull
+        })
+    return candles
 
 def get_ticker():
-    r = requests.get(f"{BASE}/fapi/v1/ticker/24hr",
-                     params={"symbol":SYMBOL},timeout=10)
-    r.raise_for_status(); return r.json()
+    """Bybit 현재가"""
+    r = requests.get(f"{BASE}/v5/market/tickers", params={
+        "category":"linear","symbol":SYMBOL
+    }, timeout=10)
+    r.raise_for_status()
+    d = r.json()
+    if d.get("retCode") != 0:
+        raise Exception(f"Bybit 오류: {d.get('retMsg')}")
+    item = d["result"]["list"][0]
+    return {
+        "lastPrice":    item["lastPrice"],
+        "price24hPcnt": item["price24hPcnt"]
+    }
 
 def get_funding_rate():
-    r = requests.get(f"{BASE}/fapi/v1/premiumIndex",
-                     params={"symbol":SYMBOL},timeout=10)
-    r.raise_for_status(); d=r.json()
-    return {"funding_rate":float(d["lastFundingRate"]),
-            "mark_price":float(d["markPrice"])}
+    """Bybit 펀딩비"""
+    r = requests.get(f"{BASE}/v5/market/funding/history", params={
+        "category":"linear","symbol":SYMBOL,"limit":1
+    }, timeout=10)
+    r.raise_for_status()
+    d = r.json()
+    if d.get("retCode") != 0 or not d["result"]["list"]:
+        return {"funding_rate": 0.0}
+    rate = float(d["result"]["list"][0]["fundingRate"])
+    return {"funding_rate": rate}
 
 def get_oi_history():
+    """Bybit 미결제약정"""
     try:
-        r = requests.get(f"{BASE}/futures/data/openInterestHist",
-                         params={"symbol":SYMBOL,"period":"5m","limit":10},timeout=10)
+        r = requests.get(f"{BASE}/v5/market/open-interest", params={
+            "category":"linear","symbol":SYMBOL,"intervalTime":"5min","limit":10
+        }, timeout=10)
         r.raise_for_status()
-        return [float(x["sumOpenInterest"]) for x in r.json()]
-    except: return []
+        d = r.json()
+        if d.get("retCode") == 0 and d["result"]["list"]:
+            return [float(x["openInterest"]) for x in reversed(d["result"]["list"])]
+    except: pass
+    return []
 
 # ═══════════════════════════════════════
 # 분석 엔진
@@ -200,7 +232,6 @@ def calc_rr(entry,tp,sl,long):
     return round(rew/risk,2) if risk>0 else 0
 
 def check_momentum(cs, direction):
-    """현재봉 방향만 확인 (완화된 모멘텀 필터)"""
     if len(cs)<2: return True
     curr=cs[-1]
     return curr["bull"] if direction=="bull" else not curr["bull"]
@@ -252,17 +283,14 @@ def analyze(candles, price, htf_trend, funding, oi_info):
               and (near_fvg and near_fvg["type"]=="bear" or near_ob and near_ob["type"]=="bear")
               and vol["bias"] in ("bear","neutral")): sig="SHORT"
 
-    # 모멘텀 필터
     if sig not in ("WAIT",):
         mdir="bull" if "LONG" in sig else "bear"
-        if not check_momentum(candles, mdir): sig="FILTERED_MOMENTUM"
+        if not check_momentum(candles,mdir): sig="FILTERED_MOMENTUM"
 
-    # HTF 필터
     if sig not in ("WAIT","FILTERED_MOMENTUM"):
         if "LONG"  in sig and htf_trend["direction"]=="bear": sig="FILTERED_HTF"
         if "SHORT" in sig and htf_trend["direction"]=="bull":  sig="FILTERED_HTF"
 
-    # 펀딩비 필터
     if sig not in ("WAIT","FILTERED_MOMENTUM","FILTERED_HTF"):
         if "LONG"  in sig and funding["long_blocked"]:  sig="FILTERED_FUND"
         if "SHORT" in sig and funding["short_blocked"]: sig="FILTERED_FUND"
@@ -300,7 +328,6 @@ def analyze(candles, price, htf_trend, funding, oi_info):
     rr2=calc_rr(price,tp2,sl_price,is_long)
     rr3=calc_rr(price,tp3,sl_price,is_long)
 
-    # 레버리지 계산 (켈리 리스크는 봇 상태에서 결정)
     lev_info=calc_leverage(price,sl_price,total)
     tp_profits={}
     if lev_info:
@@ -350,7 +377,7 @@ def rr_grade(rr):
     if rr>=1.5: return "🆗"
     return "⚠️"
 
-def format_msg(result, tf, risk_pct, consec_win, consec_lose):
+def format_msg(result, tf_label, risk_pct, consec_win, consec_lose):
     sig=result["sig"]; price=result["price"]
     tp1=result["tp1"]; tp2=result["tp2"]; tp3=result["tp3"]
     sl=result["sl"]; sl_basis=result["sl_basis"]; sl_dist=result["sl_dist"]
@@ -380,7 +407,6 @@ def format_msg(result, tf, risk_pct, consec_win, consec_lose):
         p=profits[lbl]
         return f"  → +{p['usdt']:,.1f} USDT (+{p['margin_pct']}%)"
 
-    # SL 블록
     sl_lines=[f"🛑 <b>SL: ${sl:,.1f}</b>  (-{sl_pct:.3f}% / ${abs(price-sl):,.1f})  [{sl_basis}]"]
     shown={round(sl,1)}
     for cv,cn in [(sl_ob,"OB기반"),(sl_fvg,"FVG기반"),(sl_atr,"ATR기반")]:
@@ -390,7 +416,6 @@ def format_msg(result, tf, risk_pct, consec_win, consec_lose):
             shown.add(round(cv,1))
     sl_block="\n".join(sl_lines)
 
-    # 레버리지 블록
     if lev:
         lev_icon="🔥" if lev["rec_lev"]>=10 else "⚡" if lev["rec_lev"]>=7 else "🛡️"
         liq=lev["liq_long"] if is_long else lev["liq_short"]
@@ -405,14 +430,10 @@ def format_msg(result, tf, risk_pct, consec_win, consec_lose):
     else:
         lev_block="레버리지 계산 불가"
 
-    # 켈리 리스크 상태
     risk_icon="🔥" if risk_pct==RISK_HIGH else "🛡️" if risk_pct==RISK_LOW else "⚡"
-    risk_state=(
-        f"{risk_icon} 리스크: {risk_pct*100:.1f}%  "
-        f"(연속WIN {consec_win}회 / 연속LOSE {consec_lose}회)"
-    )
+    risk_state=(f"{risk_icon} 리스크: {risk_pct*100:.1f}%  "
+                f"(연속WIN {consec_win}회 / 연속LOSE {consec_lose}회)")
 
-    # FVG
     if near_fvg:
         inz=near_fvg["bot"]*0.998<=price<=near_fvg["top"]*1.002
         fvg_line=(f"├ {'✅' if near_fvg['type']==('bull' if is_long else 'bear') else '⚠️'} "
@@ -422,7 +443,6 @@ def format_msg(result, tf, risk_pct, consec_win, consec_lose):
     else:
         fvg_line="├ ⚪ FVG: 없음"
 
-    # OB
     if near_ob:
         inz=near_ob["bot"]*0.998<=price<=near_ob["top"]*1.002
         ob_line=(f"├ {'✅' if near_ob['type']==('bull' if is_long else 'bear') else '⚠️'} "
@@ -445,7 +465,7 @@ def format_msg(result, tf, risk_pct, consec_win, consec_lose):
 
     return f"""{header}
 ━━━━━━━━━━━━━━━━━━━
-📌 BTCUSDT Perp | ⏱ {tf}
+📌 BTCUSDT Perp | ⏱ {tf_label}
 💰 <b>현재가: ${price:,.1f}</b>
 
 📈 <b>진입 & 목표가</b>
@@ -468,7 +488,7 @@ def format_msg(result, tf, risk_pct, consec_win, consec_lose):
 {vol_line}
 
 📊 <b>필터 현황</b>
-├ 현재추세({tf}): {trend_txt} | EMA20: ${trend['ema20']:,}
+├ 현재추세({tf_label}): {trend_txt} | EMA20: ${trend['ema20']:,}
 ├ 상위추세(4h): {htf_str}{htf_txt} | EMA50: ${htf['ema50']:,}
 ├ {fund_icon} 펀딩비: {funding['rate_pct']:+.4f}% ({funding['status']})
 └ 미결제약정: {oi_txt} ({oi['change_pct']:+.2f}%)
@@ -481,17 +501,13 @@ def format_msg(result, tf, risk_pct, consec_win, consec_lose):
 # ═══════════════════════════════════════
 # 상태 관리
 # ═══════════════════════════════════════
-last_signal_time  = defaultdict(dict)
-cooldown_state    = {
+cooldown_state = {
     "LONG":  {"last_ts":0,"cooldown":BASE_COOLDOWN,"consec_lose":0,"consec_win":0},
     "SHORT": {"last_ts":0,"cooldown":BASE_COOLDOWN,"consec_lose":0,"consec_win":0}
 }
-daily_loss        = defaultdict(float)
-monthly_loss      = defaultdict(float)
-daily_blocked     = defaultdict(set)
-monthly_blocked   = set()
-current_balance   = TOTAL_SEED
-monthly_start_bal = {}
+daily_loss      = defaultdict(float)
+daily_blocked   = defaultdict(set)
+monthly_blocked = set()
 
 def get_risk_pct(direction):
     cd=cooldown_state[direction]
@@ -504,7 +520,6 @@ def can_trade(direction, now_ts):
     date_key=now.strftime("%Y-%m-%d")
     month_key=now.strftime("%Y-%m")
     cd=cooldown_state[direction]
-
     if month_key in monthly_blocked:
         return False, f"월간손실 {MONTHLY_MAX_LOSS_PCT*100:.0f}% 한도 초과"
     if direction in daily_blocked[date_key]:
@@ -516,31 +531,27 @@ def can_trade(direction, now_ts):
         return False, f"일일손실 {DAILY_MAX_LOSS_PCT*100:.0f}% 한도 초과"
     return True, ""
 
-def update_state(direction, outcome, now_ts):
-    """시그널 결과 업데이트 (실전에서는 수동으로 결과를 입력해야 함)
-    봇은 자동으로 TP/SL 도달 여부를 추적하지 않으므로
-    현재는 쿨다운 + 카운터만 업데이트"""
+def mark_signal_sent(direction, now_ts):
     cd=cooldown_state[direction]
     cd["last_ts"]=now_ts
-    # 실전에서는 outcome을 알 수 없으므로 쿨다운만 적용
-    # 결과 추적은 추후 Bybit API 연동 시 구현 가능
 
 # ═══════════════════════════════════════
 # 메인 루프
 # ═══════════════════════════════════════
 def run():
     print("="*60)
-    print("  BTC 시그널 봇 v6 (B-Final)")
+    print("  BTC 시그널 봇 v6 (B-Final) - Bybit API")
     print(f"  시드: {TOTAL_SEED:,.0f} USDT")
     print(f"  리스크: {RISK_LOW*100:.0f}%/{RISK_BASE*100:.0f}%/{RISK_HIGH*100:.0f}% (켈리)")
     print(f"  쿨다운: 2h | 연속LOSE {CONSEC_LOSE_LIMIT}회 차단")
     print(f"  일손실: {DAILY_MAX_LOSS_PCT*100:.0f}% | 월손실: {MONTHLY_MAX_LOSS_PCT*100:.0f}%")
-    print(f"  TF: {', '.join(TIMEFRAMES)} | HTF: {HTF}")
+    print(f"  TF: 1h/2h/4h | HTF: 4h | API: Bybit")
     print("="*60)
 
     send_telegram(
         "🤖 <b>BTC 시그널 봇 v6 (B-Final) 시작</b>\n\n"
-        f"📌 BTCUSDT Perp | {' / '.join(TIMEFRAMES)}\n\n"
+        "📌 BTCUSDT Perp | 1h / 2h / 4h\n"
+        "🔌 API: Bybit (한국 접근 가능)\n\n"
         f"💼 시드: {TOTAL_SEED:,.0f} USDT\n"
         f"⚡ 켈리 리스크: {RISK_LOW*100:.0f}%/{RISK_BASE*100:.0f}%/{RISK_HIGH*100:.0f}%\n"
         f"⏱ 쿨다운: 2h | 연속LOSE {CONSEC_LOSE_LIMIT}회 차단\n"
@@ -561,7 +572,7 @@ def run():
         try:
             ticker=get_ticker()
             price=float(ticker["lastPrice"])
-            chg=float(ticker["priceChangePercent"])
+            chg=float(ticker["price24hPcnt"])*100
             print(f"  현재가: ${price:,.1f} ({chg:+.2f}%)")
 
             fund_raw=get_funding_rate()
@@ -571,44 +582,46 @@ def run():
             oi_hist=get_oi_history()
             oi_info=check_oi_trend(oi_hist)
 
+            # HTF 5분마다 갱신
             if now_ts-htf_last_upd>300:
-                htf_candles=get_klines(HTF,limit=100)
+                htf_candles=get_klines(HTF, limit=200)
                 htf_last_upd=now_ts
             htf_trend=check_htf_trend(htf_candles) if htf_candles else {
                 "direction":"bull","strength":1,"ema50":0,"ema200":0,
                 "strong_bull":False,"strong_bear":False,"hhhl":False,"lllh":False}
 
             for tf in TIMEFRAMES:
+                tf_label=TF_LABEL[tf]
                 try:
-                    candles=get_klines(tf)
+                    candles=get_klines(tf, limit=200)
                     result=analyze(candles,price,htf_trend,funding,oi_info)
                     sig=result["sig"]
 
                     if sig in ("WAIT","FILTERED_MOMENTUM","FILTERED_HTF","FILTERED_FUND"):
-                        print(f"  [{tf}] {sig}")
+                        print(f"  [{tf_label}] {sig}")
                         time.sleep(0.3); continue
 
                     direction="LONG" if "LONG" in sig else "SHORT"
-                    ok, reason=can_trade(direction, now_ts)
+                    ok,reason=can_trade(direction,now_ts)
 
                     lev_txt=""
                     if result["lev_info"]:
                         lev_txt=f" LEV:{result['lev_info']['rec_lev']}x"
-                    print(f"  [{tf}] {sig:15s} 점수:{result['total']}/10{lev_txt}"
-                          + (f" → 차단: {reason}" if not ok else ""))
+                    print(f"  [{tf_label}] {sig:15s} 점수:{result['total']}/10{lev_txt}"
+                          +(f" → 차단: {reason}" if not ok else ""))
 
                     if ok and result["rr1"] and result["rr1"]>=MIN_RR:
                         risk_pct=get_risk_pct(direction)
                         cd=cooldown_state[direction]
-                        msg=format_msg(result,tf,risk_pct,
+                        msg=format_msg(result,tf_label,risk_pct,
                                        cd["consec_win"],cd["consec_lose"])
                         if send_telegram(msg):
-                            update_state(direction,"SENT",now_ts)
-                            print(f"  ✅ [{tf}] 전송 완료!")
+                            mark_signal_sent(direction,now_ts)
+                            print(f"  ✅ [{tf_label}] 전송 완료!")
 
-                    time.sleep(0.3)
+                    time.sleep(0.5)
                 except Exception as e:
-                    print(f"  ⚠️ [{tf}] 오류: {e}")
+                    print(f"  ⚠️ [{tf_label}] 오류: {e}")
 
         except Exception as e:
             print(f"  ❌ 오류: {e}")
