@@ -673,7 +673,12 @@ def monitor_active_position(price):
 # ═══════════════════════════════════════
 def run():
     global active_trade
-
+# Railway 서버 IP 확인
+        try:
+            ip_r = requests.get("https://api.ipify.org?format=json", timeout=5)
+            print(f"  Railway 서버 IP: {ip_r.json()['ip']}")
+        except:
+            print("  IP 확인 실패")
     print("="*60)
     print("  BTC 자동매매 봇 v1")
     print(f"  시드: ${TOTAL_SEED} | 마진: 격리 | API: OKX→Bybit")
