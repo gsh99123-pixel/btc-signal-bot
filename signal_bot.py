@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
 """
-BTC 선물 시그널 봇 v6 (B-Final)
-FVG + OB + 거래량 + HTF 필터 + 펀딩비 필터
-+ 모멘텀 필터 + 켈리식 리스크 + 월간손실한도
-데이터: OKX API (www.okx.com) - Railway 서버 접근 확인됨
+BTC 자동매매 봇 v1
+시그널: OKX API (데이터 수집)
+실행:   Bybit API (실제 주문)
+마진:   격리마진 (Isolated)
+시드:   $100 시범운용
 """
 
-import time, datetime, requests
+import time, datetime, requests, hmac, hashlib, json, os
 from collections import defaultdict
+
+# ═══════════════════════════════════════
+# 환경변수에서 키 로드 (보안)
+# ═══════════════════════════════════════
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+BYBIT_API_KEY    = os.environ.get("BYBIT_API_KEY", "")
+BYBIT_API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 
 # ═══════════════════════════════════════
 # 설정값
 # ═══════════════════════════════════════
-TELEGRAM_TOKEN   = "8617006078:AAEarZfA75pQBZpKgJegbztO9XuHhUJCeR0"
-TELEGRAM_CHAT_ID = "8285816381"
-
-SYMBOL         = "BTC-USDT-SWAP"      # OKX 선물 심볼
-TIMEFRAMES = ["1H", "2H", "4H"]
-TF_LABEL   = {"1H":"1h", "2H":"2h", "4H":"4h"}
+OKX_SYMBOL     = "BTC-USDT-SWAP"
+BYBIT_SYMBOL   = "BTCUSDT"
+TIMEFRAMES     = ["1H", "2H", "4H"]
+TF_LABEL       = {"1H":"1h","2H":"2h","4H":"4h"}
 HTF            = "4H"
 CHECK_INTERVAL = 60
 
-# ── 시그널 조건
+# ── 시그널 조건 (B-Final)
 MIN_SCORE_DUAL   = 7
 MIN_SCORE_SINGLE = 8
 MIN_RR           = 1.8
@@ -35,13 +42,13 @@ VOL_WINDOW       = 10
 FUNDING_LONG_BLOCK  =  0.0005
 FUNDING_SHORT_BLOCK = -0.0005
 
-# ── 리스크 관리
-TOTAL_SEED           = 1500.0
-RISK_BASE            = 0.015
-RISK_HIGH            = 0.020
-RISK_LOW             = 0.010
+# ── 리스크 관리 ($100 시범운용)
+TOTAL_SEED           = 100.0   # $100 시범운용
+RISK_BASE            = 0.015   # 1.5%
+RISK_HIGH            = 0.020   # 연속WIN 2회+ → 2.0%
+RISK_LOW             = 0.010   # 연속LOSE 2회+ → 1.0%
 MIN_LEV              = 5
-MAX_LEV              = 15
+MAX_LEV              = 10
 
 # ── 손실 한도
 DAILY_MAX_LOSS_PCT   = 0.05
@@ -53,12 +60,16 @@ MAX_COOLDOWN      = 8 * 3600
 COOLDOWN_MULT     = 1.5
 CONSEC_LOSE_LIMIT = 4
 
-BASE = "https://www.okx.com"
+OKX_BASE   = "https://www.okx.com"
+BYBIT_BASE = "https://api.bybit.com"
 
 # ═══════════════════════════════════════
 # 텔레그램
 # ═══════════════════════════════════════
 def send_telegram(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"[텔레그램 미설정] {msg[:50]}")
+        return False
     url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = {"chat_id":TELEGRAM_CHAT_ID,"text":msg,"parse_mode":"HTML"}
     try:
@@ -69,78 +80,223 @@ def send_telegram(msg):
         return False
 
 # ═══════════════════════════════════════
-# OKX API
+# OKX API (시그널용)
 # ═══════════════════════════════════════
-def get_klines(bar, limit=200):
-    """OKX 캔들 데이터 — 최신순 반환 → reverse 필요"""
-    r = requests.get(f"{BASE}/api/v5/market/candles", params={
-        "instId": SYMBOL, "bar": bar, "limit": str(limit)
+def get_klines_okx(bar, limit=200):
+    r = requests.get(f"{OKX_BASE}/api/v5/market/candles", params={
+        "instId":OKX_SYMBOL,"bar":bar,"limit":str(limit)
     }, timeout=10)
     r.raise_for_status()
     d = r.json()
     if d.get("code") != "0":
-        raise Exception(f"OKX 오류: {d.get('msg')}")
-    candles = []
-    for k in reversed(d["data"]):  # 최신→과거 → 뒤집어서 과거→최신
-        o=float(k[1]); h=float(k[2]); l=float(k[3]); c=float(k[4]); v=float(k[5])
-        bull = c >= o
-        candles.append({
-            "open":o,"high":h,"low":l,"close":c,"volume":v,
-            "buy_vol": v if bull else 0.0,
-            "sell_vol": 0.0 if bull else v,
-            "bull": bull
-        })
+        raise Exception(f"OKX:{d.get('msg')}")
+    candles=[]
+    for k in reversed(d["data"]):
+        o=float(k[1]);h=float(k[2]);l=float(k[3]);c=float(k[4]);v=float(k[5])
+        bull=c>=o
+        candles.append({"open":o,"high":h,"low":l,"close":c,"volume":v,
+                        "buy_vol":v if bull else 0.0,
+                        "sell_vol":0.0 if bull else v,"bull":bull})
     return candles
 
-def get_ticker():
-    """OKX 현재가"""
-    r = requests.get(f"{BASE}/api/v5/market/ticker", params={
-        "instId": SYMBOL
-    }, timeout=10)
+def get_ticker_okx():
+    r = requests.get(f"{OKX_BASE}/api/v5/market/ticker",
+                     params={"instId":OKX_SYMBOL},timeout=10)
     r.raise_for_status()
     d = r.json()
-    if d.get("code") != "0":
-        raise Exception(f"OKX 오류: {d.get('msg')}")
-    item = d["data"][0]
-    last  = float(item["last"])
-    open24= float(item["open24h"])
-    chg   = (last - open24) / open24 * 100 if open24 > 0 else 0
-    return {"lastPrice": str(last), "price24hPcnt": str(round(chg/100, 6))}
+    if d.get("code") != "0": raise Exception(f"OKX:{d.get('msg')}")
+    item=d["data"][0]
+    last=float(item["last"]); open24=float(item["open24h"])
+    chg=(last-open24)/open24*100 if open24>0 else 0
+    return {"lastPrice":str(last),"price24hPcnt":str(round(chg/100,6))}
 
-def get_funding_rate():
-    """OKX 펀딩비"""
+def get_funding_okx():
     try:
-        r = requests.get(f"{BASE}/api/v5/public/funding-rate", params={
-            "instId": SYMBOL
-        }, timeout=10)
+        r = requests.get(f"{OKX_BASE}/api/v5/public/funding-rate",
+                         params={"instId":OKX_SYMBOL},timeout=10)
         r.raise_for_status()
         d = r.json()
-        if d.get("code") == "0" and d["data"]:
-            rate = float(d["data"][0]["fundingRate"])
-            return {"funding_rate": rate}
-    except Exception as e:
-        print(f"  [펀딩비 오류] {e}")
-    return {"funding_rate": 0.0}
+        if d.get("code")=="0" and d["data"]:
+            return {"funding_rate":float(d["data"][0]["fundingRate"])}
+    except: pass
+    return {"funding_rate":0.0}
 
-def get_oi_history():
-    """OKX 미결제약정"""
+def get_oi_okx():
     try:
-        r = requests.get(f"{BASE}/api/v5/public/open-interest", params={
-            "instType": "SWAP", "instId": SYMBOL
-        }, timeout=10)
+        r = requests.get(f"{OKX_BASE}/api/v5/public/open-interest",
+                         params={"instType":"SWAP","instId":OKX_SYMBOL},timeout=10)
         r.raise_for_status()
         d = r.json()
-        if d.get("code") == "0" and d["data"]:
-            oi = float(d["data"][0]["oi"])
-            return [oi] * 6  # 현재값만 있으므로 동일값 반복
-    except Exception as e:
-        print(f"  [OI 오류] {e}")
+        if d.get("code")=="0" and d["data"]:
+            oi=float(d["data"][0]["oi"])
+            return [oi]*6
+    except: pass
     return []
+
+# ═══════════════════════════════════════
+# Bybit API (주문용)
+# ═══════════════════════════════════════
+def bybit_sign(params_str):
+    return hmac.new(BYBIT_API_SECRET.encode(),
+                    params_str.encode(), hashlib.sha256).hexdigest()
+
+def bybit_request(method, endpoint, params=None, body=None):
+    ts = str(int(time.time() * 1000))
+    recv_window = "5000"
+
+    if method == "GET":
+        query = "&".join(f"{k}={v}" for k,v in sorted((params or {}).items()))
+        sign_str = ts + BYBIT_API_KEY + recv_window + query
+        sig = bybit_sign(sign_str)
+        headers = {
+            "X-BAPI-API-KEY":    BYBIT_API_KEY,
+            "X-BAPI-TIMESTAMP":  ts,
+            "X-BAPI-SIGN":       sig,
+            "X-BAPI-RECV-WINDOW":recv_window
+        }
+        r = requests.get(f"{BYBIT_BASE}{endpoint}",
+                         params=params, headers=headers, timeout=10)
+    else:
+        body_str = json.dumps(body or {})
+        sign_str = ts + BYBIT_API_KEY + recv_window + body_str
+        sig = bybit_sign(sign_str)
+        headers = {
+            "X-BAPI-API-KEY":    BYBIT_API_KEY,
+            "X-BAPI-TIMESTAMP":  ts,
+            "X-BAPI-SIGN":       sig,
+            "X-BAPI-RECV-WINDOW":recv_window,
+            "Content-Type":      "application/json"
+        }
+        r = requests.post(f"{BYBIT_BASE}{endpoint}",
+                          data=body_str, headers=headers, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def get_balance_bybit():
+    """잔고 조회"""
+    try:
+        d = bybit_request("GET","/v5/account/wallet-balance",
+                          params={"accountType":"UNIFIED","coin":"USDT"})
+        if d.get("retCode")==0:
+            coins=d["result"]["list"][0]["coin"]
+            for c in coins:
+                if c["coin"]=="USDT":
+                    return float(c["availableToWithdraw"])
+    except Exception as e:
+        print(f"[잔고조회 오류] {e}")
+    return 0.0
+
+def get_position_bybit():
+    """현재 포지션 조회"""
+    try:
+        d = bybit_request("GET","/v5/position/list",
+                          params={"category":"linear","symbol":BYBIT_SYMBOL})
+        if d.get("retCode")==0:
+            for p in d["result"]["list"]:
+                if float(p.get("size","0")) > 0:
+                    return {
+                        "side":      p["side"],
+                        "size":      float(p["size"]),
+                        "entryPrice":float(p["avgPrice"]),
+                        "leverage":  float(p["leverage"]),
+                        "unrealPnl": float(p["unrealisedPnl"]),
+                        "liqPrice":  float(p.get("liqPrice","0")),
+                        "posIdx":    p.get("positionIdx","0")
+                    }
+    except Exception as e:
+        print(f"[포지션조회 오류] {e}")
+    return None
+
+def set_leverage_bybit(leverage):
+    """레버리지 설정"""
+    try:
+        d = bybit_request("POST","/v5/position/set-leverage", body={
+            "category":"linear","symbol":BYBIT_SYMBOL,
+            "buyLeverage":str(leverage),"sellLeverage":str(leverage)
+        })
+        return d.get("retCode")==0
+    except Exception as e:
+        print(f"[레버리지설정 오류] {e}")
+    return False
+
+def set_margin_mode_bybit():
+    """격리마진 설정"""
+    try:
+        d = bybit_request("POST","/v5/position/switch-isolated", body={
+            "category":"linear","symbol":BYBIT_SYMBOL,
+            "tradeMode":1,  # 1=격리, 0=교차
+            "buyLeverage":"5","sellLeverage":"5"
+        })
+        if d.get("retCode") in (0, 110026):  # 110026=이미 격리마진
+            return True
+    except Exception as e:
+        print(f"[마진모드 오류] {e}")
+    return False
+
+def place_order_bybit(side, qty, leverage, tp_price, sl_price):
+    """
+    시장가 주문 + TP/SL 동시 설정
+    side: "Buy" or "Sell"
+    """
+    try:
+        set_margin_mode_bybit()
+        set_leverage_bybit(leverage)
+        time.sleep(0.3)
+
+        body = {
+            "category":    "linear",
+            "symbol":      BYBIT_SYMBOL,
+            "side":        side,
+            "orderType":   "Market",
+            "qty":         str(qty),
+            "takeProfit":  str(round(tp_price, 1)),
+            "stopLoss":    str(round(sl_price, 1)),
+            "tpTriggerBy": "LastPrice",
+            "slTriggerBy": "LastPrice",
+            "timeInForce": "GTC",
+            "positionIdx": 0   # 단방향 모드
+        }
+        d = bybit_request("POST","/v5/order/create", body=body)
+        if d.get("retCode")==0:
+            return {"success":True,"orderId":d["result"]["orderId"]}
+        else:
+            return {"success":False,"error":d.get("retMsg","")}
+    except Exception as e:
+        return {"success":False,"error":str(e)}
+
+def close_position_bybit(side, qty):
+    """포지션 청산"""
+    close_side = "Sell" if side=="Buy" else "Buy"
+    try:
+        body = {
+            "category":"linear","symbol":BYBIT_SYMBOL,
+            "side":close_side,"orderType":"Market",
+            "qty":str(qty),"reduceOnly":True,
+            "timeInForce":"GTC","positionIdx":0
+        }
+        d = bybit_request("POST","/v5/order/create",body=body)
+        return d.get("retCode")==0
+    except Exception as e:
+        print(f"[청산 오류] {e}")
+    return False
+
+def get_min_qty_bybit(price):
+    """최소 주문 수량 계산 (BTC 단위, 소수점 3자리)"""
+    try:
+        d = bybit_request("GET","/v5/market/instruments-info",
+                          params={"category":"linear","symbol":BYBIT_SYMBOL})
+        if d.get("retCode")==0:
+            info=d["result"]["list"][0]
+            min_qty=float(info["lotSizeFilter"]["minOrderQty"])
+            qty_step=float(info["lotSizeFilter"]["qtyStep"])
+            return min_qty, qty_step
+    except: pass
+    return 0.001, 0.001
 
 # ═══════════════════════════════════════
 # 분석 엔진
 # ═══════════════════════════════════════
-def calc_atr(cs, p=14):
+def calc_atr(cs,p=14):
     trs=[]
     for i in range(1,len(cs)):
         c,pv=cs[i],cs[i-1]
@@ -223,9 +379,7 @@ def check_oi_trend(oi_hist):
     if len(oi_hist)<3: return {"trend":"unknown","change_pct":0}
     avg_new=sum(oi_hist[-3:])/3; avg_old=sum(oi_hist[:3])/3
     change=(avg_new-avg_old)/avg_old*100 if avg_old>0 else 0
-    if change>1: trend="increasing"
-    elif change<-1: trend="decreasing"
-    else: trend="neutral"
+    trend="increasing" if change>1 else "decreasing" if change<-1 else "neutral"
     return {"trend":trend,"change_pct":round(change,2)}
 
 def calc_rr(entry,tp,sl,long):
@@ -235,8 +389,7 @@ def calc_rr(entry,tp,sl,long):
 
 def check_momentum(cs, direction):
     if len(cs)<2: return True
-    curr=cs[-1]
-    return curr["bull"] if direction=="bull" else not curr["bull"]
+    return cs[-1]["bull"] if direction=="bull" else not cs[-1]["bull"]
 
 def analyze(candles, price, htf_trend, funding, oi_info):
     atr=calc_atr(candles); fvgs=detect_fvg(candles)
@@ -288,20 +441,16 @@ def analyze(candles, price, htf_trend, funding, oi_info):
     if sig not in ("WAIT",):
         mdir="bull" if "LONG" in sig else "bear"
         if not check_momentum(candles,mdir): sig="FILTERED_MOMENTUM"
-
     if sig not in ("WAIT","FILTERED_MOMENTUM"):
         if "LONG"  in sig and htf_trend["direction"]=="bear": sig="FILTERED_HTF"
         if "SHORT" in sig and htf_trend["direction"]=="bull":  sig="FILTERED_HTF"
-
     if sig not in ("WAIT","FILTERED_MOMENTUM","FILTERED_HTF"):
         if "LONG"  in sig and funding["long_blocked"]:  sig="FILTERED_FUND"
         if "SHORT" in sig and funding["short_blocked"]: sig="FILTERED_FUND"
 
     if "FILTERED" in sig or sig=="WAIT":
         return {"sig":sig,"total":total,"price":price,
-                "tp1":None,"tp2":None,"tp3":None,"sl":None,
-                "rr1":None,"rr2":None,"rr3":None,"sl_basis":None,
-                "lev_info":None,"tp_profits":{}}
+                "tp1":None,"sl":None,"rr1":None,"leverage":None}
 
     is_long="LONG" in sig; strong="STRONG" in sig
     tp_m=ATR_TP_MULT*(1.2 if strong else 1.0)
@@ -319,7 +468,6 @@ def analyze(candles, price, htf_trend, funding, oi_info):
         valid=(is_long and cand<price) or (not is_long and cand>price)
         if valid and abs(price-cand)>=atr*0.5 and calc_rr(price,tp1,cand,is_long)>=MIN_RR:
             sl_price=cand; sl_basis=basis; break
-
     if calc_rr(price,tp1,sl_price,is_long)<MIN_RR:
         mr=max(abs(tp1-price)/MIN_RR,atr*0.5)
         sl_price=(price-mr) if is_long else (price+mr)
@@ -330,175 +478,48 @@ def analyze(candles, price, htf_trend, funding, oi_info):
     rr2=calc_rr(price,tp2,sl_price,is_long)
     rr3=calc_rr(price,tp3,sl_price,is_long)
 
-    lev_info=calc_leverage(price,sl_price,total)
-    tp_profits={}
-    if lev_info:
-        pos=lev_info["position_size"]; mrg=lev_info["margin"]
-        for lbl,tpv in [("tp1",tp1),("tp2",tp2),("tp3",tp3)]:
-            gp=abs(tpv-price)/price*100
-            prof=round(pos*(gp/100),2)
-            mp=round(prof/mrg*100,1) if mrg>0 else 0
-            tp_profits[lbl]={"usdt":prof,"margin_pct":mp}
+    # 레버리지 결정
+    if total>=9:   leverage=10; grade="공격적"
+    elif total>=8: leverage=7;  grade="중간"
+    else:          leverage=5;  grade="보수적"
 
     return {"sig":sig,"total":total,"price":price,"is_long":is_long,
+            "tp1":tp1,"tp2":tp2,"tp3":tp3,"sl":sl_price,"sl_basis":sl_basis,
+            "sl_dist":round(sl_dist,3),"rr1":rr1,"rr2":rr2,"rr3":rr3,
+            "atr":round(atr,1),"leverage":leverage,"grade":grade,
             "near_fvg":near_fvg,"near_ob":near_ob,"vol":vol,"trend":tr,
-            "htf_trend":htf_trend,"funding":funding,"oi_info":oi_info,
-            "atr":round(atr,1),"tp1":tp1,"tp2":tp2,"tp3":tp3,
-            "sl":sl_price,"sl_basis":sl_basis,"sl_dist":round(sl_dist,3),
-            "sl_ob":sl_ob,"sl_fvg":sl_fvg,"sl_atr":sl_atr,
-            "rr1":rr1,"rr2":rr2,"rr3":rr3,"rr":rr1,
-            "lev_info":lev_info,"tp_profits":tp_profits}
-
-def calc_leverage(price, sl_price, score):
-    if not sl_price or price==0: return None
-    sl_dist=abs(price-sl_price)/price
-    if sl_dist==0: return None
-    if score>=9:   loss_usdt=TOTAL_SEED*0.02; rec_lev=10; grade="공격적"
-    elif score>=8: loss_usdt=TOTAL_SEED*0.015; rec_lev=7; grade="중간"
-    else:          loss_usdt=TOTAL_SEED*0.01;  rec_lev=5; grade="보수적"
-    pos=round(loss_usdt/sl_dist,2)
-    margin=round(pos/rec_lev,2)
-    if margin>TOTAL_SEED*0.4:
-        rec_lev=max(MIN_LEV,min(MAX_LEV,int(pos/(TOTAL_SEED*0.4))))
-        margin=round(pos/rec_lev,2)
-    return {"rec_lev":rec_lev,"position_size":pos,"margin":margin,
-            "btc_qty":round(pos/price,6),"loss_usdt":round(pos*sl_dist,2),
-            "loss_pct":round(pos*sl_dist/TOTAL_SEED*100,2),
-            "sl_dist_pct":round(sl_dist*100,3),"risk_grade":grade,
-            "liq_long":round(price*(1-1/rec_lev+0.0005),1),
-            "liq_short":round(price*(1+1/rec_lev-0.0005),1)}
+            "htf_trend":htf_trend,"funding":funding,"oi_info":oi_info}
 
 # ═══════════════════════════════════════
-# 메시지 포맷
+# 포지션 크기 계산
 # ═══════════════════════════════════════
-def rr_grade(rr):
-    if rr is None: return ""
-    if rr>=4.0: return "🏆"
-    if rr>=3.0: return "💎"
-    if rr>=2.0: return "✅"
-    if rr>=1.5: return "🆗"
-    return "⚠️"
+def calc_position(price, sl_price, risk_pct, leverage):
+    """
+    손실금액 = 포지션크기 × SL거리
+    포지션크기 = 손실금액 / SL거리
+    BTC수량 = 포지션크기 / 현재가
+    증거금 = 포지션크기 / 레버리지
+    """
+    risk_amt = TOTAL_SEED * risk_pct
+    sl_dist  = abs(price - sl_price) / price
+    if sl_dist == 0: return None
+    pos_size = risk_amt / sl_dist
+    margin   = pos_size / leverage
+    btc_qty  = pos_size / price
 
-def format_msg(result, tf_label, risk_pct, consec_win, consec_lose):
-    sig=result["sig"]; price=result["price"]
-    tp1=result["tp1"]; tp2=result["tp2"]; tp3=result["tp3"]
-    sl=result["sl"]; sl_basis=result["sl_basis"]; sl_dist=result["sl_dist"]
-    rr1=result["rr1"]; rr2=result["rr2"]; rr3=result["rr3"]
-    sl_ob=result["sl_ob"]; sl_fvg=result["sl_fvg"]; sl_atr=result["sl_atr"]
-    lev=result["lev_info"]; profits=result["tp_profits"]
-    near_fvg=result["near_fvg"]; near_ob=result["near_ob"]
-    vol=result["vol"]; trend=result["trend"]; htf=result["htf_trend"]
-    funding=result["funding"]; oi=result["oi_info"]; atr=result["atr"]
-    total=result["total"]
+    # 최소 수량 체크
+    min_qty, qty_step = get_min_qty_bybit(price)
+    btc_qty = max(btc_qty, min_qty)
+    # 수량 단위에 맞게 반올림
+    btc_qty = round(round(btc_qty / qty_step) * qty_step, 6)
 
-    is_long="LONG" in sig; strong="STRONG" in sig
-    now=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    if strong and is_long:   header="🚀 <b>LONG 강한 시그널!</b>"
-    elif is_long:            header="🟢 <b>LONG 시그널</b>"
-    elif strong:             header="💥 <b>SHORT 강한 시그널!</b>"
-    else:                    header="🔴 <b>SHORT 시그널</b>"
-
-    tp1_pct=abs(tp1-price)/price*100
-    tp2_pct=abs(tp2-price)/price*100
-    tp3_pct=abs(tp3-price)/price*100
-    sl_pct=abs(sl-price)/price*100
-
-    def profit_str(lbl):
-        if not profits.get(lbl): return ""
-        p=profits[lbl]
-        return f"  → +{p['usdt']:,.1f} USDT (+{p['margin_pct']}%)"
-
-    sl_lines=[f"🛑 <b>SL: ${sl:,.1f}</b>  (-{sl_pct:.3f}% / ${abs(price-sl):,.1f})  [{sl_basis}]"]
-    shown={round(sl,1)}
-    for cv,cn in [(sl_ob,"OB기반"),(sl_fvg,"FVG기반"),(sl_atr,"ATR기반")]:
-        if cv and round(cv,1) not in shown:
-            pct=abs(price-cv)/price*100
-            sl_lines.append(f"   ├ {cn}: ${cv:,.1f}  (-{pct:.3f}%)")
-            shown.add(round(cv,1))
-    sl_block="\n".join(sl_lines)
-
-    if lev:
-        lev_icon="🔥" if lev["rec_lev"]>=10 else "⚡" if lev["rec_lev"]>=7 else "🛡️"
-        liq=lev["liq_long"] if is_long else lev["liq_short"]
-        lev_block=(
-            f"┌ {lev_icon} <b>추천 레버리지: {lev['rec_lev']}x</b>  ({lev['risk_grade']})\n"
-            f"├ 포지션: ${lev['position_size']:,.2f} USDT  ({lev['btc_qty']} BTC)\n"
-            f"├ 증거금: ${lev['margin']:,.2f} USDT\n"
-            f"├ 청산가: ${liq:,.1f}\n"
-            f"├ 최대손실: ${lev['loss_usdt']:,.2f} USDT ({lev['loss_pct']}% / {TOTAL_SEED:,.0f} USDT)\n"
-            f"└ SL거리: {lev['sl_dist_pct']:.3f}%"
-        )
-    else:
-        lev_block="레버리지 계산 불가"
-
-    risk_icon="🔥" if risk_pct==RISK_HIGH else "🛡️" if risk_pct==RISK_LOW else "⚡"
-    risk_state=(f"{risk_icon} 리스크: {risk_pct*100:.1f}%  "
-                f"(연속WIN {consec_win}회 / 연속LOSE {consec_lose}회)")
-
-    if near_fvg:
-        inz=near_fvg["bot"]*0.998<=price<=near_fvg["top"]*1.002
-        fvg_line=(f"├ {'✅' if near_fvg['type']==('bull' if is_long else 'bear') else '⚠️'} "
-                  f"<b>FVG {near_fvg['type'].upper()}</b>: "
-                  f"${near_fvg['bot']:,.1f}~${near_fvg['top']:,.1f} "
-                  f"(갭 {near_fvg['gap_pct']:.2f}%) {'내부✅' if inz else '근접'}")
-    else:
-        fvg_line="├ ⚪ FVG: 없음"
-
-    if near_ob:
-        inz=near_ob["bot"]*0.998<=price<=near_ob["top"]*1.002
-        ob_line=(f"├ {'✅' if near_ob['type']==('bull' if is_long else 'bear') else '⚠️'} "
-                 f"<b>OB {near_ob['type'].upper()}</b>: "
-                 f"${near_ob['bot']:,.1f}~${near_ob['top']:,.1f} "
-                 f"(강도 {near_ob['move_pct']:.2f}%) {'내부✅' if inz else '근접'}")
-    else:
-        ob_line="├ ⚪ OB: 없음"
-
-    surge=" 🔥급증" if vol["vol_surge"] else ""
-    vol_icon="✅" if vol["bias"]==("bull" if is_long else "bear") else "⚠️"
-    vol_line=f"└ {vol_icon} <b>거래량</b>: 매수{vol['buy_pct']}% 매도{vol['sell_pct']}%{surge}"
-
-    trend_txt="상승 HH+HL" if trend["hhhl"] else "하락 LH+LL" if trend["lllh"] else "중립"
-    htf_txt="상승✅" if htf["direction"]=="bull" else "하락✅"
-    htf_str="강한 " if (htf["strong_bull"] or htf["strong_bear"]) else ""
-    fund_icon="✅" if not(funding["long_blocked"] or funding["short_blocked"]) else "⚠️"
-    oi_txt={"increasing":"증가📈","decreasing":"감소📉","neutral":"중립➡️"}.get(oi["trend"],"—")
-    filled="█"*total+"░"*(10-total)
-
-    return f"""{header}
-━━━━━━━━━━━━━━━━━━━
-📌 BTCUSDT Perp | ⏱ {tf_label}
-💰 <b>현재가: ${price:,.1f}</b>
-
-📈 <b>진입 & 목표가</b>
-🟡 진입가: ${price:,.1f}
-🎯 TP1: ${tp1:,.1f}  (+{tp1_pct:.2f}%)  R:R {rr_grade(rr1)} 1:{rr1}{profit_str('tp1')}
-🎯 TP2: ${tp2:,.1f}  (+{tp2_pct:.2f}%)  R:R {rr_grade(rr2)} 1:{rr2}{profit_str('tp2')}
-🎯 TP3: ${tp3:,.1f}  (+{tp3_pct:.2f}%)  R:R {rr_grade(rr3)} 1:{rr3}{profit_str('tp3')}
-
-📉 <b>손절 라인 (SL)</b>
-{sl_block}
-📏 ATR: ${atr:,}
-
-💼 <b>포지션 설정 (시드 {TOTAL_SEED:,.0f} USDT)</b>
-{lev_block}
-{risk_state}
-
-📋 <b>시그널 근거</b>
-{fvg_line}
-{ob_line}
-{vol_line}
-
-📊 <b>필터 현황</b>
-├ 현재추세({tf_label}): {trend_txt} | EMA20: ${trend['ema20']:,}
-├ 상위추세(4h): {htf_str}{htf_txt} | EMA50: ${htf['ema50']:,}
-├ {fund_icon} 펀딩비: {funding['rate_pct']:+.4f}% ({funding['status']})
-└ 미결제약정: {oi_txt} ({oi['change_pct']:+.2f}%)
-
-⚡ 강도: {filled} {total}/10
-🕐 {now} KST
-━━━━━━━━━━━━━━━━━━━
-⚠️ SL 필수 | 추천 레버리지 참고용""".strip()
+    return {
+        "pos_size":  round(pos_size, 2),
+        "margin":    round(margin, 2),
+        "btc_qty":   btc_qty,
+        "risk_amt":  round(risk_amt, 2),
+        "sl_dist":   round(sl_dist*100, 3)
+    }
 
 # ═══════════════════════════════════════
 # 상태 관리
@@ -510,6 +531,9 @@ cooldown_state = {
 daily_loss      = defaultdict(float)
 daily_blocked   = defaultdict(set)
 monthly_blocked = set()
+
+# 현재 포지션 추적
+active_trade = None  # {"side", "entry", "tp1", "sl", "qty", "leverage", "time", "tf"}
 
 def get_risk_pct(direction):
     cd=cooldown_state[direction]
@@ -533,33 +557,149 @@ def can_trade(direction, now_ts):
         return False, f"일일손실 {DAILY_MAX_LOSS_PCT*100:.0f}% 한도 초과"
     return True, ""
 
-def mark_signal_sent(direction, now_ts):
-    cooldown_state[direction]["last_ts"]=now_ts
+def update_after_close(direction, pnl, risk_amt, date_key, month_key):
+    """포지션 종료 후 상태 업데이트"""
+    cd=cooldown_state[direction]
+    cd["last_ts"]=int(time.time())
+    if pnl < 0:
+        daily_loss[date_key]+=abs(pnl)
+        cd["consec_lose"]+=1; cd["consec_win"]=0
+        if cd["consec_lose"]>=CONSEC_LOSE_LIMIT:
+            daily_blocked[date_key].add(direction)
+        cd["cooldown"]=min(cd["cooldown"]*COOLDOWN_MULT, MAX_COOLDOWN)
+        # 월간 손실 체크
+        # (간단히 일손실 누적으로 근사)
+    else:
+        cd["consec_win"]+=1; cd["consec_lose"]=0
+        cd["cooldown"]=BASE_COOLDOWN
+
+# ═══════════════════════════════════════
+# 포지션 모니터링
+# ═══════════════════════════════════════
+def monitor_active_position(price):
+    """
+    활성 포지션 TP/SL 도달 여부 확인
+    Bybit이 자동으로 TP/SL 처리하지만
+    봇에서도 추적하여 텔레그램 알림 전송
+    """
+    global active_trade
+    if not active_trade: return
+
+    pos = get_position_bybit()
+    now = datetime.datetime.now()
+    date_key  = now.strftime("%Y-%m-%d")
+    month_key = now.strftime("%Y-%m")
+
+    # 포지션이 닫힌 경우 (TP or SL 도달)
+    if pos is None:
+        entry  = active_trade["entry"]
+        tp1    = active_trade["tp1"]
+        sl     = active_trade["sl"]
+        side   = active_trade["side"]
+        qty    = active_trade["qty"]
+        lev    = active_trade["leverage"]
+        tf     = active_trade["tf"]
+        is_long= side=="Buy"
+
+        # 어떤 결과인지 판단
+        if is_long:
+            if price >= tp1 * 0.999:
+                result="WIN"; pnl=round((price-entry)*qty,2)
+                emoji="✅"; reason="TP1 도달"
+            elif price <= sl * 1.001:
+                result="LOSE"; pnl=round((price-entry)*qty,2)
+                emoji="❌"; reason="SL 도달"
+            else:
+                result="CLOSED"; pnl=round((price-entry)*qty,2)
+                emoji="⏹️"; reason="수동청산 또는 청산"
+        else:
+            if price <= tp1 * 1.001:
+                result="WIN"; pnl=round((entry-price)*qty,2)
+                emoji="✅"; reason="TP1 도달"
+            elif price >= sl * 0.999:
+                result="LOSE"; pnl=round((entry-price)*qty,2)
+                emoji="❌"; reason="SL 도달"
+            else:
+                result="CLOSED"; pnl=round((entry-price)*qty,2)
+                emoji="⏹️"; reason="수동청산 또는 청산"
+
+        duration = (now - active_trade["time"]).seconds // 60
+
+        # 원인 분석
+        analysis = ""
+        if result == "LOSE":
+            sl_dist = abs(entry-sl)/entry*100
+            analysis = (
+                f"\n\n📊 <b>원인 분석</b>\n"
+                f"├ SL 거리: {sl_dist:.3f}%\n"
+                f"├ SL 기준: {active_trade.get('sl_basis','')}\n"
+                f"├ 보유시간: {duration}분\n"
+                f"└ 개선 포인트: SL이 너무 좁거나 추세 역행"
+            )
+        elif result == "WIN":
+            profit_pct = pnl / (active_trade.get("margin",1)) * 100
+            analysis = (
+                f"\n\n📊 <b>수익 분석</b>\n"
+                f"├ 수익률(증거금): +{profit_pct:.1f}%\n"
+                f"├ 보유시간: {duration}분\n"
+                f"└ 패턴: {tf} {side} 성공"
+            )
+
+        msg = (
+            f"{emoji} <b>포지션 종료 — {result}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"📌 {BYBIT_SYMBOL} | {tf} | {side}\n"
+            f"💰 진입가: ${entry:,.1f}\n"
+            f"💰 종료가: ${price:,.1f}\n"
+            f"🎯 TP1:   ${tp1:,.1f}\n"
+            f"🛑 SL:    ${sl:,.1f}\n"
+            f"📦 수량:  {qty} BTC\n"
+            f"⚡ 레버리지: {lev}x\n"
+            f"💵 손익:  {pnl:+.2f} USDT\n"
+            f"⏱ 사유: {reason}"
+            f"{analysis}\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"🕐 {now.strftime('%Y-%m-%d %H:%M:%S')} KST"
+        )
+        send_telegram(msg)
+
+        direction = "LONG" if is_long else "SHORT"
+        update_after_close(direction, pnl, 0, date_key, month_key)
+        active_trade = None
+        print(f"  포지션 종료: {result} PnL={pnl:+.2f} USDT")
 
 # ═══════════════════════════════════════
 # 메인 루프
 # ═══════════════════════════════════════
 def run():
+    global active_trade
+
     print("="*60)
-    print("  BTC 시그널 봇 v6 (B-Final) - OKX API")
-    print(f"  시드: {TOTAL_SEED:,.0f} USDT")
+    print("  BTC 자동매매 봇 v1")
+    print(f"  시드: ${TOTAL_SEED} | 마진: 격리 | API: OKX→Bybit")
     print(f"  리스크: {RISK_LOW*100:.0f}%/{RISK_BASE*100:.0f}%/{RISK_HIGH*100:.0f}% (켈리)")
-    print(f"  쿨다운: 2h | 연속LOSE {CONSEC_LOSE_LIMIT}회 차단")
     print(f"  일손실: {DAILY_MAX_LOSS_PCT*100:.0f}% | 월손실: {MONTHLY_MAX_LOSS_PCT*100:.0f}%")
-    print(f"  TF: 1h/2h/4h | HTF: 4h | API: OKX")
     print("="*60)
 
+    # API 키 확인
+    if not BYBIT_API_KEY or not BYBIT_API_SECRET:
+        print("❌ BYBIT_API_KEY 또는 BYBIT_API_SECRET 환경변수 없음")
+        send_telegram("❌ 자동매매 봇 시작 실패: Bybit API 키 없음")
+        return
+
+    # 잔고 확인
+    balance = get_balance_bybit()
+    print(f"  Bybit 잔고: ${balance:.2f} USDT")
+
     send_telegram(
-        "🤖 <b>BTC 시그널 봇 v6 (B-Final) 시작</b>\n\n"
-        "📌 BTCUSDT Perp | 1h / 2h / 4h\n"
-        "🔌 API: OKX (Railway 서버 접근 확인됨)\n\n"
-        f"💼 시드: {TOTAL_SEED:,.0f} USDT\n"
+        "🤖 <b>BTC 자동매매 봇 v1 시작</b>\n\n"
+        f"📌 {BYBIT_SYMBOL} 선물 | 격리마진\n"
+        f"💼 시드: ${TOTAL_SEED} USDT\n"
+        f"💰 Bybit 잔고: ${balance:.2f} USDT\n"
         f"⚡ 켈리 리스크: {RISK_LOW*100:.0f}%/{RISK_BASE*100:.0f}%/{RISK_HIGH*100:.0f}%\n"
         f"⏱ 쿨다운: 2h | 연속LOSE {CONSEC_LOSE_LIMIT}회 차단\n"
         f"🛡️ 일손실 {DAILY_MAX_LOSS_PCT*100:.0f}% | 월손실 {MONTHLY_MAX_LOSS_PCT*100:.0f}%\n\n"
-        f"🔍 OB+FVG={MIN_SCORE_DUAL}점 | 하나만={MIN_SCORE_SINGLE}점\n"
-        f"📐 ATR_SL={ATR_SL_MULT} | FVG>={FVG_MIN_GAP_PCT}% | OB>={OB_MIN_MOVE_PCT}%\n\n"
-        "FVG + OB + 거래량 + 모멘텀 분석 중..."
+        "시그널 분석 시작..."
     )
 
     htf_candles=[]; htf_last_upd=0; cycle=0
@@ -571,29 +711,43 @@ def run():
         print(f"\n[{now_str}] 사이클 #{cycle}")
 
         try:
-            ticker=get_ticker()
+            ticker=get_ticker_okx()
             price=float(ticker["lastPrice"])
             chg=float(ticker["price24hPcnt"])*100
             print(f"  현재가: ${price:,.1f} ({chg:+.2f}%)")
 
-            fund_raw=get_funding_rate()
+            # 활성 포지션 모니터링
+            monitor_active_position(price)
+
+            # 이미 포지션 있으면 신규 진입 안 함
+            if active_trade:
+                pos=get_position_bybit()
+                if pos:
+                    print(f"  활성포지션: {pos['side']} {pos['size']}BTC "
+                          f"진입${pos['entryPrice']:,.1f} "
+                          f"미실현PnL:{pos['unrealPnl']:+.2f}")
+                time.sleep(CHECK_INTERVAL); continue
+
+            fund_raw=get_funding_okx()
             funding=check_funding(fund_raw)
             print(f"  펀딩비: {funding['rate_pct']:+.4f}% ({funding['status']})")
 
-            oi_hist=get_oi_history()
+            oi_hist=get_oi_okx()
             oi_info=check_oi_trend(oi_hist)
 
             if now_ts-htf_last_upd>300:
-                htf_candles=get_klines(HTF, limit=200)
+                htf_candles=get_klines_okx(HTF,limit=200)
                 htf_last_upd=now_ts
             htf_trend=check_htf_trend(htf_candles) if htf_candles else {
                 "direction":"bull","strength":1,"ema50":0,"ema200":0,
                 "strong_bull":False,"strong_bear":False,"hhhl":False,"lllh":False}
 
+            best_signal = None  # 가장 높은 점수 시그널 선택
+
             for tf in TIMEFRAMES:
                 tf_label=TF_LABEL[tf]
                 try:
-                    candles=get_klines(tf, limit=200)
+                    candles=get_klines_okx(tf,limit=200)
                     result=analyze(candles,price,htf_trend,funding,oi_info)
                     sig=result["sig"]
 
@@ -604,27 +758,104 @@ def run():
                     direction="LONG" if "LONG" in sig else "SHORT"
                     ok,reason=can_trade(direction,now_ts)
 
-                    lev_txt=""
-                    if result["lev_info"]:
-                        lev_txt=f" LEV:{result['lev_info']['rec_lev']}x"
-                    print(f"  [{tf_label}] {sig:15s} 점수:{result['total']}/10{lev_txt}"
+                    print(f"  [{tf_label}] {sig:15s} 점수:{result['total']}/10 "
+                          f"LEV:{result['leverage']}x"
                           +(f" → 차단: {reason}" if not ok else ""))
 
                     if ok and result["rr1"] and result["rr1"]>=MIN_RR:
-                        risk_pct=get_risk_pct(direction)
-                        cd=cooldown_state[direction]
-                        msg=format_msg(result,tf_label,risk_pct,
-                                       cd["consec_win"],cd["consec_lose"])
-                        if send_telegram(msg):
-                            mark_signal_sent(direction,now_ts)
-                            print(f"  ✅ [{tf_label}] 전송 완료!")
+                        if best_signal is None or result["total"]>best_signal["total"]:
+                            best_signal = {**result, "tf_label":tf_label}
 
                     time.sleep(0.5)
                 except Exception as e:
                     print(f"  ⚠️ [{tf_label}] 오류: {e}")
 
+            # 최고 점수 시그널로 진입
+            if best_signal:
+                sig       = best_signal["sig"]
+                direction = "LONG" if "LONG" in sig else "SHORT"
+                is_long   = best_signal["is_long"]
+                leverage  = best_signal["leverage"]
+                tp1       = best_signal["tp1"]
+                sl        = best_signal["sl"]
+                sl_basis  = best_signal["sl_basis"]
+                rr1       = best_signal["rr1"]
+                tf_label  = best_signal["tf_label"]
+                atr       = best_signal["atr"]
+
+                risk_pct  = get_risk_pct(direction)
+                pos_info  = calc_position(price, sl, risk_pct, leverage)
+
+                if not pos_info:
+                    print("  ⚠️ 포지션 크기 계산 실패")
+                else:
+                    side = "Buy" if is_long else "Sell"
+                    qty  = pos_info["btc_qty"]
+
+                    print(f"\n  🚀 주문 실행: {side} {qty}BTC @ ${price:,.1f}")
+                    print(f"     TP: ${tp1:,.1f} | SL: ${sl:,.1f} | LEV: {leverage}x")
+                    print(f"     증거금: ${pos_info['margin']} | 리스크: ${pos_info['risk_amt']}")
+
+                    order = place_order_bybit(side, qty, leverage, tp1, sl)
+
+                    if order["success"]:
+                        active_trade = {
+                            "side":      side,
+                            "entry":     price,
+                            "tp1":       tp1,
+                            "tp2":       best_signal["tp2"],
+                            "tp3":       best_signal["tp3"],
+                            "sl":        sl,
+                            "sl_basis":  sl_basis,
+                            "qty":       qty,
+                            "leverage":  leverage,
+                            "margin":    pos_info["margin"],
+                            "risk_amt":  pos_info["risk_amt"],
+                            "tf":        tf_label,
+                            "sig":       sig,
+                            "time":      datetime.datetime.now(),
+                            "order_id":  order["orderId"]
+                        }
+                        cooldown_state[direction]["last_ts"]=now_ts
+
+                        tp1_pct=abs(tp1-price)/price*100
+                        sl_pct =abs(sl-price)/price*100
+
+                        send_telegram(
+                            f"{'🚀' if 'STRONG' in sig and is_long else '🟢' if is_long else '💥' if 'STRONG' in sig else '🔴'} "
+                            f"<b>{'LONG' if is_long else 'SHORT'} 자동진입 완료!</b>\n"
+                            f"━━━━━━━━━━━━━━━━━━━\n"
+                            f"📌 {BYBIT_SYMBOL} | {tf_label} | 격리마진\n"
+                            f"⚡ 레버리지: {leverage}x ({best_signal['grade']})\n\n"
+                            f"💰 진입가:  ${price:,.1f}\n"
+                            f"🎯 TP1:    ${tp1:,.1f}  (+{tp1_pct:.2f}%)  R:R 1:{rr1}\n"
+                            f"🎯 TP2:    ${best_signal['tp2']:,.1f}\n"
+                            f"🎯 TP3:    ${best_signal['tp3']:,.1f}\n"
+                            f"🛑 SL:     ${sl:,.1f}  (-{sl_pct:.2f}%) [{sl_basis}]\n\n"
+                            f"📦 수량:   {qty} BTC\n"
+                            f"💵 증거금: ${pos_info['margin']} USDT\n"
+                            f"⚠️ 최대손실: ${pos_info['risk_amt']} USDT "
+                            f"({risk_pct*100:.1f}%)\n"
+                            f"📏 ATR:    ${atr:,}\n\n"
+                            f"⚡ 시그널 강도: {best_signal['total']}/10\n"
+                            f"🔑 주문ID: {order['orderId']}\n"
+                            f"🕐 {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} KST"
+                        )
+                        print(f"  ✅ 주문 성공! ID: {order['orderId']}")
+                    else:
+                        err=order["error"]
+                        print(f"  ❌ 주문 실패: {err}")
+                        send_telegram(
+                            f"❌ <b>주문 실패</b>\n"
+                            f"사유: {err}\n"
+                            f"시그널: {sig} | {tf_label}\n"
+                            f"진입가: ${price:,.1f}\n"
+                            f"→ 원인 분석 후 재시도"
+                        )
+
         except Exception as e:
             print(f"  ❌ 오류: {e}")
+            send_telegram(f"⚠️ 봇 오류 발생\n{str(e)[:200]}")
 
         print(f"  → {CHECK_INTERVAL}초 후 재실행...")
         time.sleep(CHECK_INTERVAL)
