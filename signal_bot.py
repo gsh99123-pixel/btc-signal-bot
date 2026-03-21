@@ -16,8 +16,8 @@ TELEGRAM_TOKEN   = "8617006078:AAEarZfA75pQBZpKgJegbztO9XuHhUJCeR0"
 TELEGRAM_CHAT_ID = "8285816381"
 
 SYMBOL         = "BTC-USDT-SWAP"      # OKX 선물 심볼
-TIMEFRAMES     = ["60m","2H","4H"]    # OKX: 60m=1h, 2H=2h, 4H=4h
-TF_LABEL       = {"60m":"1h","2H":"2h","4H":"4h"}
+TIMEFRAMES = ["1H", "2H", "4H"]
+TF_LABEL   = {"1H":"1h", "2H":"2h", "4H":"4h"}
 HTF            = "4H"
 CHECK_INTERVAL = 60
 
