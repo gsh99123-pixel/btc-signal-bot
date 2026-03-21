@@ -3,7 +3,7 @@
 BTC 선물 시그널 봇 v6 (B-Final)
 FVG + OB + 거래량 + HTF 필터 + 펀딩비 필터
 + 모멘텀 필터 + 켈리식 리스크 + 월간손실한도
-데이터: Bybit API (api.bybit.com) - 한국 접근 가능
+데이터: OKX API (www.okx.com) - Railway 서버 접근 확인됨
 """
 
 import time, datetime, requests
@@ -15,10 +15,10 @@ from collections import defaultdict
 TELEGRAM_TOKEN   = "8617006078:AAEarZfA75pQBZpKgJegbztO9XuHhUJCeR0"
 TELEGRAM_CHAT_ID = "8285816381"
 
-SYMBOL         = "BTCUSDT"
-TIMEFRAMES     = ["60", "120", "240"]  # Bybit: 분 단위
-TF_LABEL       = {"60":"1h","120":"2h","240":"4h"}
-HTF            = "240"
+SYMBOL         = "BTC-USDT-SWAP"      # OKX 선물 심볼
+TIMEFRAMES     = ["60m","2H","4H"]    # OKX: 60m=1h, 2H=2h, 4H=4h
+TF_LABEL       = {"60m":"1h","2H":"2h","4H":"4h"}
+HTF            = "4H"
 CHECK_INTERVAL = 60
 
 # ── 시그널 조건
@@ -53,7 +53,7 @@ MAX_COOLDOWN      = 8 * 3600
 COOLDOWN_MULT     = 1.5
 CONSEC_LOSE_LIMIT = 4
 
-BASE = "https://api.bybit.com"
+BASE = "https://www.okx.com"
 
 # ═══════════════════════════════════════
 # 텔레그램
@@ -69,70 +69,72 @@ def send_telegram(msg):
         return False
 
 # ═══════════════════════════════════════
-# Bybit API
+# OKX API
 # ═══════════════════════════════════════
-def get_klines(interval, limit=200):
-    """Bybit 선물 캔들 데이터"""
-    r = requests.get(f"{BASE}/v5/market/kline", params={
-        "category":"linear","symbol":SYMBOL,
-        "interval":interval,"limit":limit
+def get_klines(bar, limit=200):
+    """OKX 캔들 데이터 — 최신순 반환 → reverse 필요"""
+    r = requests.get(f"{BASE}/api/v5/market/candles", params={
+        "instId": SYMBOL, "bar": bar, "limit": str(limit)
     }, timeout=10)
     r.raise_for_status()
     d = r.json()
-    if d.get("retCode") != 0:
-        raise Exception(f"Bybit 오류: {d.get('retMsg')}")
+    if d.get("code") != "0":
+        raise Exception(f"OKX 오류: {d.get('msg')}")
     candles = []
-    for k in reversed(d["result"]["list"]):
-        # Bybit 순서: [timestamp, open, high, low, close, volume, turnover]
+    for k in reversed(d["data"]):  # 최신→과거 → 뒤집어서 과거→최신
         o=float(k[1]); h=float(k[2]); l=float(k[3]); c=float(k[4]); v=float(k[5])
         bull = c >= o
-        # Bybit는 taker buy/sell 분리 없음 → 상승봉=매수, 하락봉=매도로 근사
-        buy_vol  = v if bull else 0.0
-        sell_vol = 0.0 if bull else v
         candles.append({
-            "open":o,"high":h,"low":l,"close":c,
-            "volume":v,"buy_vol":buy_vol,"sell_vol":sell_vol,"bull":bull
+            "open":o,"high":h,"low":l,"close":c,"volume":v,
+            "buy_vol": v if bull else 0.0,
+            "sell_vol": 0.0 if bull else v,
+            "bull": bull
         })
     return candles
 
 def get_ticker():
-    """Bybit 현재가"""
-    r = requests.get(f"{BASE}/v5/market/tickers", params={
-        "category":"linear","symbol":SYMBOL
+    """OKX 현재가"""
+    r = requests.get(f"{BASE}/api/v5/market/ticker", params={
+        "instId": SYMBOL
     }, timeout=10)
     r.raise_for_status()
     d = r.json()
-    if d.get("retCode") != 0:
-        raise Exception(f"Bybit 오류: {d.get('retMsg')}")
-    item = d["result"]["list"][0]
-    return {
-        "lastPrice":    item["lastPrice"],
-        "price24hPcnt": item["price24hPcnt"]
-    }
+    if d.get("code") != "0":
+        raise Exception(f"OKX 오류: {d.get('msg')}")
+    item = d["data"][0]
+    last  = float(item["last"])
+    open24= float(item["open24h"])
+    chg   = (last - open24) / open24 * 100 if open24 > 0 else 0
+    return {"lastPrice": str(last), "price24hPcnt": str(round(chg/100, 6))}
 
 def get_funding_rate():
-    """Bybit 펀딩비"""
-    r = requests.get(f"{BASE}/v5/market/funding/history", params={
-        "category":"linear","symbol":SYMBOL,"limit":1
-    }, timeout=10)
-    r.raise_for_status()
-    d = r.json()
-    if d.get("retCode") != 0 or not d["result"]["list"]:
-        return {"funding_rate": 0.0}
-    rate = float(d["result"]["list"][0]["fundingRate"])
-    return {"funding_rate": rate}
-
-def get_oi_history():
-    """Bybit 미결제약정"""
+    """OKX 펀딩비"""
     try:
-        r = requests.get(f"{BASE}/v5/market/open-interest", params={
-            "category":"linear","symbol":SYMBOL,"intervalTime":"5min","limit":10
+        r = requests.get(f"{BASE}/api/v5/public/funding-rate", params={
+            "instId": SYMBOL
         }, timeout=10)
         r.raise_for_status()
         d = r.json()
-        if d.get("retCode") == 0 and d["result"]["list"]:
-            return [float(x["openInterest"]) for x in reversed(d["result"]["list"])]
-    except: pass
+        if d.get("code") == "0" and d["data"]:
+            rate = float(d["data"][0]["fundingRate"])
+            return {"funding_rate": rate}
+    except Exception as e:
+        print(f"  [펀딩비 오류] {e}")
+    return {"funding_rate": 0.0}
+
+def get_oi_history():
+    """OKX 미결제약정"""
+    try:
+        r = requests.get(f"{BASE}/api/v5/public/open-interest", params={
+            "instType": "SWAP", "instId": SYMBOL
+        }, timeout=10)
+        r.raise_for_status()
+        d = r.json()
+        if d.get("code") == "0" and d["data"]:
+            oi = float(d["data"][0]["oi"])
+            return [oi] * 6  # 현재값만 있으므로 동일값 반복
+    except Exception as e:
+        print(f"  [OI 오류] {e}")
     return []
 
 # ═══════════════════════════════════════
@@ -532,26 +534,25 @@ def can_trade(direction, now_ts):
     return True, ""
 
 def mark_signal_sent(direction, now_ts):
-    cd=cooldown_state[direction]
-    cd["last_ts"]=now_ts
+    cooldown_state[direction]["last_ts"]=now_ts
 
 # ═══════════════════════════════════════
 # 메인 루프
 # ═══════════════════════════════════════
 def run():
     print("="*60)
-    print("  BTC 시그널 봇 v6 (B-Final) - Bybit API")
+    print("  BTC 시그널 봇 v6 (B-Final) - OKX API")
     print(f"  시드: {TOTAL_SEED:,.0f} USDT")
     print(f"  리스크: {RISK_LOW*100:.0f}%/{RISK_BASE*100:.0f}%/{RISK_HIGH*100:.0f}% (켈리)")
     print(f"  쿨다운: 2h | 연속LOSE {CONSEC_LOSE_LIMIT}회 차단")
     print(f"  일손실: {DAILY_MAX_LOSS_PCT*100:.0f}% | 월손실: {MONTHLY_MAX_LOSS_PCT*100:.0f}%")
-    print(f"  TF: 1h/2h/4h | HTF: 4h | API: Bybit")
+    print(f"  TF: 1h/2h/4h | HTF: 4h | API: OKX")
     print("="*60)
 
     send_telegram(
         "🤖 <b>BTC 시그널 봇 v6 (B-Final) 시작</b>\n\n"
         "📌 BTCUSDT Perp | 1h / 2h / 4h\n"
-        "🔌 API: Bybit (한국 접근 가능)\n\n"
+        "🔌 API: OKX (Railway 서버 접근 확인됨)\n\n"
         f"💼 시드: {TOTAL_SEED:,.0f} USDT\n"
         f"⚡ 켈리 리스크: {RISK_LOW*100:.0f}%/{RISK_BASE*100:.0f}%/{RISK_HIGH*100:.0f}%\n"
         f"⏱ 쿨다운: 2h | 연속LOSE {CONSEC_LOSE_LIMIT}회 차단\n"
@@ -582,7 +583,6 @@ def run():
             oi_hist=get_oi_history()
             oi_info=check_oi_trend(oi_hist)
 
-            # HTF 5분마다 갱신
             if now_ts-htf_last_upd>300:
                 htf_candles=get_klines(HTF, limit=200)
                 htf_last_upd=now_ts
@@ -599,7 +599,7 @@ def run():
 
                     if sig in ("WAIT","FILTERED_MOMENTUM","FILTERED_HTF","FILTERED_FUND"):
                         print(f"  [{tf_label}] {sig}")
-                        time.sleep(0.3); continue
+                        time.sleep(0.5); continue
 
                     direction="LONG" if "LONG" in sig else "SHORT"
                     ok,reason=can_trade(direction,now_ts)
