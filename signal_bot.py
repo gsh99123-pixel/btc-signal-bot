@@ -173,7 +173,7 @@ def bybit_request(method, endpoint, params=None, body=None):
     return r.json()
 
 def get_balance_bybit():
-    """잔고 조회"""
+    """잔고 조회 — Unified Trading 계정"""
     try:
         d = bybit_request("GET","/v5/account/wallet-balance",
                           params={"accountType":"UNIFIED","coin":"USDT"})
@@ -181,9 +181,23 @@ def get_balance_bybit():
             coins=d["result"]["list"][0]["coin"]
             for c in coins:
                 if c["coin"]=="USDT":
-                    return float(c["availableToWithdraw"])
+                    # availableToWithdraw 또는 walletBalance 사용
+                    bal = c.get("availableToWithdraw") or c.get("walletBalance") or "0"
+                    return float(bal)
     except Exception as e:
-        print(f"[잔고조회 오류] {e}")
+        print(f"[잔고조회 오류 UNIFIED] {e}")
+    # CONTRACT 계정으로 재시도
+    try:
+        d = bybit_request("GET","/v5/account/wallet-balance",
+                          params={"accountType":"CONTRACT","coin":"USDT"})
+        if d.get("retCode")==0:
+            coins=d["result"]["list"][0]["coin"]
+            for c in coins:
+                if c["coin"]=="USDT":
+                    bal = c.get("availableToWithdraw") or c.get("walletBalance") or "0"
+                    return float(bal)
+    except Exception as e:
+        print(f"[잔고조회 오류 CONTRACT] {e}")
     return 0.0
 
 def get_position_bybit():
@@ -694,6 +708,9 @@ def run():
         print("❌ BYBIT_API_KEY 또는 BYBIT_API_SECRET 환경변수 없음")
         send_telegram("❌ 자동매매 봇 시작 실패: Bybit API 키 없음")
         return
+
+    print(f"  API Key 앞 6자리: {BYBIT_API_KEY[:6]}...")
+    print(f"  API Secret 앞 6자리: {BYBIT_API_SECRET[:6]}...")
 
     # 잔고 확인
     balance = get_balance_bybit()
