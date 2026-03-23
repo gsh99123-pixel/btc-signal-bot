@@ -143,6 +143,7 @@ def get_klines(bar, limit=200):
     r.raise_for_status()
     d = r.json()
     if d.get("code")!="0": raise Exception(f"OKX:{d.get('msg')}")
+    if not d.get("data"): raise Exception(f"OKX: 데이터 없음 ({bar})")
     candles=[]
     for k in reversed(d["data"]):
         o=float(k[1]);h=float(k[2]);l=float(k[3]);c=float(k[4]);v=float(k[5])
@@ -150,6 +151,7 @@ def get_klines(bar, limit=200):
         candles.append({"open":o,"high":h,"low":l,"close":c,"volume":v,
                         "buy_vol":v if bull else 0.0,
                         "sell_vol":0.0 if bull else v,"bull":bull})
+    if not candles: raise Exception(f"OKX: 캔들 파싱 실패 ({bar})")
     return candles
 
 def get_ticker():
@@ -375,6 +377,11 @@ def analyze(candles, price, htf_trend, funding, oi_info):
                    "tp1":None,"tp2":None,"tp3":None,"sl":None,
                    "rr1":None,"rr2":None,"rr3":None,"sl_basis":None,
                    "lev_info":None,"tp_profits":{},"rsi_info":None}
+
+    if not candles or len(candles)<30: return {**WAIT_RESULT,"sig":"WAIT"}
+    if not htf_trend or not isinstance(htf_trend,dict): return {**WAIT_RESULT,"sig":"WAIT"}
+    if not funding or not isinstance(funding,dict): return {**WAIT_RESULT,"sig":"WAIT"}
+    if not oi_info or not isinstance(oi_info,dict): return {**WAIT_RESULT,"sig":"WAIT"}
 
     if not check_volatility(candles):
         return {**WAIT_RESULT,"sig":"FILTERED_VOL"}
@@ -810,7 +817,13 @@ def run():
                 tf_label=TF_LABEL[tf]
                 try:
                     candles=get_klines(tf,limit=200)
+                    if not candles:
+                        print(f"  [{TF_LABEL[tf]}] 캔들 데이터 없음 — 스킵")
+                        time.sleep(0.5); continue
                     result=analyze(candles,price,htf_trend,funding,oi_info)
+                    if result is None:
+                        print(f"  [{TF_LABEL[tf]}] analyze 반환값 없음 — 스킵")
+                        time.sleep(0.5); continue
                     sig=result["sig"]
 
                     if sig in ("WAIT","FILTERED_MOMENTUM","FILTERED_HTF",
