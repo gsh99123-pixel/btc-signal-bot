@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 """
 BTC 선물 시그널 봇 v12b
-기반: v8 + RSI 다이버전스 필터 + 부분 익절 안내
+기반: v6.1 (B-Final) + RSI 다이버전스 필터 + 부분 익절 안내 + 변동성 필터
 
-v12b 변경사항 (v8 대비):
-  ① RSI 다이버전스 감지
-     강한 강세 다이버전스 → LONG 신호 강화 (+2점)
-     강한 약세 다이버전스 → SHORT 신호 강화 (+2점)
-     역다이버전스 → 해당 방향 시그널 차단
-  ② 부분 익절 안내 메시지
-     TP1: 50% 익절 + SL → 본전 이동
-     TP2: 나머지 50% 전량 익절
+v12b 변경사항 (v6.1 대비):
+① RSI 다이버전스 감지 → 강한 다이버전스 +2점, 역다이버전스 차단
+② 부분 익절 안내 (TP1: 50% 익절 + SL→본전, TP2: 나머지 50%)
+③ 변동성 필터 (ATR 기반 횡보장 필터링)
+④ TP/SL 조정: MIN_RR=1.5, ATR_TP=2.0, ATR_SL=1.3
+⑤ 3일 연속 손실 시 24h 전체 차단
 
-백테스팅 결과 (387일 v12b):
-  시그널: 204건 | 승률: 40.7% | EV: +0.468
-  수익률: +371.9% | 수수료 후: +349.5%
-  최대낙폭: -18.3% | 최대연속손실: 11회
-  (v8 대비 +84.2%p 향상)
+보안: 텔레그램 토큰 → 환경변수
+상태 영속화: state.json (재시작 시 복원)
 """
-
 import os, time, datetime, json, requests
 from collections import defaultdict
 
@@ -48,11 +42,11 @@ VOL_WINDOW       = 10
 ATR_VOL_THRESHOLD = 0.65
 ATR_LOOKBACK      = 20
 
-# ── RSI 다이버전스 설정 (v12b 신규)
-RSI_PERIOD        = 14
-RSI_DIV_LOOKBACK  = 20   # 다이버전스 탐색 구간 (봉)
-RSI_BULL_MAX      = 40   # 강세 다이버전스: RSI < 40
-RSI_BEAR_MIN      = 60   # 약세 다이버전스: RSI > 60
+# ── RSI 다이버전스 설정
+RSI_PERIOD       = 14
+RSI_DIV_LOOKBACK = 20
+RSI_BULL_MAX     = 40
+RSI_BEAR_MIN     = 60
 
 # ── 필터
 FUNDING_LONG_BLOCK  =  0.0005
@@ -74,11 +68,11 @@ MAX_COOLDOWN      = 8 * 3600
 COOLDOWN_MULT     = 1.5
 CONSEC_LOSE_LIMIT = 3
 
-BASE       = "https://www.okx.com"
+BASE = "https://www.okx.com"
 STATE_FILE = "state.json"
 
 # ═══════════════════════════════════════
-# 상태 영속화
+# 상태 영속화 (state.json)
 # ═══════════════════════════════════════
 def default_state():
     return {
@@ -86,32 +80,33 @@ def default_state():
             "LONG":  {"last_ts":0,"cooldown":BASE_COOLDOWN,"consec_lose":0,"consec_win":0},
             "SHORT": {"last_ts":0,"cooldown":BASE_COOLDOWN,"consec_lose":0,"consec_win":0}
         },
-        "daily_loss":    {},
+        "daily_loss": {},
         "daily_blocked": {},
         "monthly_blocked": [],
-        "daily_had_loss":  {},
+        "daily_had_loss": {},
         "global_blocked_until": 0,
-        "signals_sent":  []
+        "signals_sent": []
     }
 
 def load_state():
     try:
-        with open(STATE_FILE,"r") as f:
-            data=json.load(f)
-            d=default_state()
+        with open(STATE_FILE, "r") as f:
+            data = json.load(f)
+            d = default_state()
             for k in d:
-                if k not in data: data[k]=d[k]
+                if k not in data:
+                    data[k] = d[k]
             for direction in ["LONG","SHORT"]:
                 if direction not in data["cooldown"]:
-                    data["cooldown"][direction]=d["cooldown"][direction]
+                    data["cooldown"][direction] = d["cooldown"][direction]
             return data
-    except (FileNotFoundError,json.JSONDecodeError):
+    except (FileNotFoundError, json.JSONDecodeError):
         return default_state()
 
 def save_state():
     try:
-        with open(STATE_FILE,"w") as f:
-            json.dump(state,f,indent=2,ensure_ascii=False)
+        with open(STATE_FILE, "w") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
     except Exception as e:
         print(f"  [상태 저장 오류] {e}")
 
@@ -122,13 +117,13 @@ state = load_state()
 # ═══════════════════════════════════════
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[텔레그램] 환경변수를 설정하세요.")
+        print("[텔레그램] TELEGRAM_TOKEN / TELEGRAM_CHAT_ID 환경변수를 설정하세요.")
         return False
     url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     data = {"chat_id":TELEGRAM_CHAT_ID,"text":msg,"parse_mode":"HTML"}
     try:
-        r = requests.post(url,data=data,timeout=10)
-        return r.status_code==200
+        r = requests.post(url, data=data, timeout=10)
+        return r.status_code == 200
     except Exception as e:
         print(f"[텔레그램 오류] {e}")
         return False
@@ -137,13 +132,15 @@ def send_telegram(msg):
 # OKX API
 # ═══════════════════════════════════════
 def get_klines(bar, limit=200):
-    r = requests.get(f"{BASE}/api/v5/market/candles",params={
+    r = requests.get(f"{BASE}/api/v5/market/candles", params={
         "instId":SYMBOL,"bar":bar,"limit":str(limit)
-    },timeout=10)
+    }, timeout=10)
     r.raise_for_status()
     d = r.json()
-    if d.get("code")!="0": raise Exception(f"OKX:{d.get('msg')}")
-    if not d.get("data"): raise Exception(f"OKX: 데이터 없음 ({bar})")
+    if d.get("code") != "0":
+        raise Exception(f"OKX:{d.get('msg')}")
+    if not d.get("data"):
+        raise Exception(f"OKX: 데이터 없음 ({bar})")
     candles=[]
     for k in reversed(d["data"]):
         o=float(k[1]);h=float(k[2]);l=float(k[3]);c=float(k[4]);v=float(k[5])
@@ -151,14 +148,16 @@ def get_klines(bar, limit=200):
         candles.append({"open":o,"high":h,"low":l,"close":c,"volume":v,
                         "buy_vol":v if bull else 0.0,
                         "sell_vol":0.0 if bull else v,"bull":bull})
-    if not candles: raise Exception(f"OKX: 캔들 파싱 실패 ({bar})")
+    if not candles:
+        raise Exception(f"OKX: 캔들 파싱 실패 ({bar})")
     return candles
 
 def get_ticker():
-    r = requests.get(f"{BASE}/api/v5/market/ticker",params={"instId":SYMBOL},timeout=10)
+    r = requests.get(f"{BASE}/api/v5/market/ticker",
+                     params={"instId":SYMBOL},timeout=10)
     r.raise_for_status()
     d = r.json()
-    if d.get("code")!="0": raise Exception(f"OKX:{d.get('msg')}")
+    if d.get("code") != "0": raise Exception(f"OKX:{d.get('msg')}")
     item=d["data"][0]
     last=float(item["last"]); open24=float(item["open24h"])
     chg=(last-open24)/open24*100 if open24>0 else 0
@@ -166,7 +165,8 @@ def get_ticker():
 
 def get_funding_rate():
     try:
-        r = requests.get(f"{BASE}/api/v5/public/funding-rate",params={"instId":SYMBOL},timeout=10)
+        r = requests.get(f"{BASE}/api/v5/public/funding-rate",
+                         params={"instId":SYMBOL},timeout=10)
         r.raise_for_status()
         d = r.json()
         if d.get("code")=="0" and d["data"]:
@@ -191,23 +191,29 @@ def get_oi_history():
 # RSI 계산 및 다이버전스 감지
 # ═══════════════════════════════════════
 def calc_rsi(cs, p=14):
-    if len(cs)<p+1: return 50.0
-    closes=[c["close"] for c in cs[-(p+1):]]
-    gains=[]; losses=[]
-    for i in range(1,len(closes)):
-        d=closes[i]-closes[i-1]
-        gains.append(max(d,0)); losses.append(max(-d,0))
-    avg_g=sum(gains)/p; avg_l=sum(losses)/p
-    if avg_l==0: return 100.0
-    rs=avg_g/avg_l
-    return round(100-100/(1+rs),2)
+    if len(cs) < p + 1:
+        return 50.0
+    closes = [c["close"] for c in cs[-(p+1):]]
+    gains = []; losses = []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i-1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    avg_g = sum(gains) / p
+    avg_l = sum(losses) / p
+    if avg_l == 0:
+        return 100.0
+    rs = avg_g / avg_l
+    return round(100 - 100 / (1 + rs), 2)
 
 def calc_rsi_series(cs, p=14):
-    result=[]
+    result = []
     for i in range(len(cs)):
-        if i<p: result.append(50.0); continue
-        sub=cs[max(0,i-p-1):i+1]
-        result.append(calc_rsi(sub,p))
+        if i < p:
+            result.append(50.0)
+            continue
+        sub = cs[max(0, i - p - 1):i + 1]
+        result.append(calc_rsi(sub, p))
     return result
 
 def detect_rsi_divergence(cs, direction):
@@ -220,43 +226,41 @@ def detect_rsi_divergence(cs, direction):
       -1: 역다이버전스 → 진입 차단
     """
     lookback = RSI_DIV_LOOKBACK
-    if len(cs)<lookback+RSI_PERIOD: return 0, ""
+    if len(cs) < lookback + RSI_PERIOD:
+        return 0, ""
 
     rsi_series = calc_rsi_series(cs, RSI_PERIOD)
-    lows  = [c["low"]  for c in cs]
+    lows = [c["low"] for c in cs]
     highs = [c["high"] for c in cs]
-    n = len(cs)-1
+    n = len(cs) - 1
 
-    if direction=="bull":
-        # 가격 저점 2개 탐색
-        price_lows=[]
-        for i in range(n-lookback, n-1):
-            if i>0 and lows[i]<=lows[i-1] and lows[i]<=lows[i+1]:
+    if direction == "bull":
+        price_lows = []
+        for i in range(n - lookback, n - 1):
+            if i > 0 and lows[i] <= lows[i-1] and lows[i] <= lows[i+1]:
                 price_lows.append((i, lows[i], rsi_series[i]))
-        if len(price_lows)<2: return 0, ""
-        p1,p2 = price_lows[-2], price_lows[-1]
-
-        if p2[1]<p1[1] and p2[2]>p1[2] and p2[2]<RSI_BULL_MAX:
+        if len(price_lows) < 2:
+            return 0, ""
+        p1, p2 = price_lows[-2], price_lows[-1]
+        if p2[1] < p1[1] and p2[2] > p1[2] and p2[2] < RSI_BULL_MAX:
             return 2, f"강세다이버전스 RSI:{p2[2]:.0f}"
-        if p2[1]<=p1[1]*1.005 and p2[2]>p1[2]+2:
-            return 1, f"약세다이버전스 RSI:{p2[2]:.0f}"
-        if p2[1]<p1[1]*0.995 and p2[2]<p1[2]-2 and p2[2]<35:
+        if p2[1] <= p1[1] * 1.005 and p2[2] > p1[2] + 2:
+            return 1, f"약한강세다이버전스 RSI:{p2[2]:.0f}"
+        if p2[1] < p1[1] * 0.995 and p2[2] < p1[2] - 2 and p2[2] < 35:
             return -1, f"역다이버전스(LONG차단) RSI:{p2[2]:.0f}"
-
-    else:  # SHORT
-        # 가격 고점 2개 탐색
-        price_highs=[]
-        for i in range(n-lookback, n-1):
-            if i>0 and highs[i]>=highs[i-1] and highs[i]>=highs[i+1]:
+    else:
+        price_highs = []
+        for i in range(n - lookback, n - 1):
+            if i > 0 and highs[i] >= highs[i-1] and highs[i] >= highs[i+1]:
                 price_highs.append((i, highs[i], rsi_series[i]))
-        if len(price_highs)<2: return 0, ""
-        p1,p2 = price_highs[-2], price_highs[-1]
-
-        if p2[1]>p1[1] and p2[2]<p1[2] and p2[2]>RSI_BEAR_MIN:
+        if len(price_highs) < 2:
+            return 0, ""
+        p1, p2 = price_highs[-2], price_highs[-1]
+        if p2[1] > p1[1] and p2[2] < p1[2] and p2[2] > RSI_BEAR_MIN:
             return 2, f"약세다이버전스 RSI:{p2[2]:.0f}"
-        if p2[1]>=p1[1]*0.995 and p2[2]<p1[2]-2:
+        if p2[1] >= p1[1] * 0.995 and p2[2] < p1[2] - 2:
             return 1, f"약한약세다이버전스 RSI:{p2[2]:.0f}"
-        if p2[1]>p1[1]*1.005 and p2[2]>p1[2]+2 and p2[2]>65:
+        if p2[1] > p1[1] * 1.005 and p2[2] > p1[2] + 2 and p2[2] > 65:
             return -1, f"역다이버전스(SHORT차단) RSI:{p2[2]:.0f}"
 
     return 0, ""
@@ -272,17 +276,20 @@ def calc_atr(cs, p=14):
     sl=trs[-p:]; return sum(sl)/len(sl) if sl else 0
 
 def check_volatility(cs):
-    if len(cs)<ATR_LOOKBACK+14: return True
-    current_atr=calc_atr(cs[-14:])
-    atr_list=[]
+    if len(cs) < ATR_LOOKBACK + 14:
+        return True
+    current_atr = calc_atr(cs[-14:])
+    atr_list = []
     for i in range(ATR_LOOKBACK):
-        start=-(ATR_LOOKBACK-i+14)
-        end=-(ATR_LOOKBACK-i) if (ATR_LOOKBACK-i)>0 else None
-        seg=cs[start:end] if end else cs[start:]
-        if len(seg)>=14: atr_list.append(calc_atr(seg))
-    if not atr_list: return True
-    avg_atr=sum(atr_list)/len(atr_list)
-    return current_atr>=avg_atr*ATR_VOL_THRESHOLD if avg_atr>0 else True
+        start = -(ATR_LOOKBACK - i + 14)
+        end = -(ATR_LOOKBACK - i) if (ATR_LOOKBACK - i) > 0 else None
+        seg = cs[start:end] if end else cs[start:]
+        if len(seg) >= 14:
+            atr_list.append(calc_atr(seg))
+    if not atr_list:
+        return True
+    avg_atr = sum(atr_list) / len(atr_list)
+    return current_atr >= avg_atr * ATR_VOL_THRESHOLD if avg_atr > 0 else True
 
 def detect_fvg(cs):
     out=[]
@@ -372,37 +379,42 @@ def check_momentum(cs, direction):
     if len(cs)<2: return True
     return cs[-1]["bull"] if direction=="bull" else not cs[-1]["bull"]
 
+# WAIT/FILTERED 반환용 기본값 (rsi_info를 빈 dict가 아닌 기본값으로 설정)
+_RSI_DEFAULT = {"score":0, "desc":"", "current_rsi":50.0}
+
 def analyze(candles, price, htf_trend, funding, oi_info):
-    WAIT_RESULT = {"sig":"WAIT","total":0,"price":price,
+    WAIT_RESULT = {"sig":"WAIT","total":0,"base_score":0,"price":price,
                    "tp1":None,"tp2":None,"tp3":None,"sl":None,
                    "rr1":None,"rr2":None,"rr3":None,"sl_basis":None,
-                   "lev_info":None,"tp_profits":{},"rsi_info":None}
+                   "lev_info":None,"tp_profits":{},"rsi_info":_RSI_DEFAULT}
 
-    if not candles or len(candles)<30: return {**WAIT_RESULT,"sig":"WAIT"}
-    if not htf_trend or not isinstance(htf_trend,dict): return {**WAIT_RESULT,"sig":"WAIT"}
-    if not funding or not isinstance(funding,dict): return {**WAIT_RESULT,"sig":"WAIT"}
-    if not oi_info or not isinstance(oi_info,dict): return {**WAIT_RESULT,"sig":"WAIT"}
+    if not candles or len(candles) < 30:
+        return {**WAIT_RESULT, "sig":"WAIT"}
+    if not htf_trend or not isinstance(htf_trend, dict):
+        return {**WAIT_RESULT, "sig":"WAIT"}
+    if not funding or not isinstance(funding, dict):
+        return {**WAIT_RESULT, "sig":"WAIT"}
+    if not oi_info or not isinstance(oi_info, dict):
+        return {**WAIT_RESULT, "sig":"WAIT"}
 
+    # 변동성 필터
     if not check_volatility(candles):
-        return {**WAIT_RESULT,"sig":"FILTERED_VOL"}
+        return {**WAIT_RESULT, "sig":"FILTERED_VOL"}
 
     atr=calc_atr(candles); fvgs=detect_fvg(candles)
     obs=detect_ob(candles); vol=analyze_volume(candles); tr=detect_trend(candles)
-
     near_fvg,fsc=None,0
     for f in reversed(fvgs[-8:]):
         inz=f["bot"]*0.998<=price<=f["top"]*1.002
         dist=min(abs(price-f["bot"]),abs(price-f["top"]))/price*100
         if inz:   near_fvg=f;fsc=3 if f["type"]==tr["direction"] else 1;break
         elif dist<0.3 and not near_fvg: near_fvg=f;fsc=2 if f["type"]==tr["direction"] else 1
-
     near_ob,osc=None,0
     for o in reversed(obs[-6:]):
         inz=o["bot"]*0.998<=price<=o["top"]*1.002
         dist=min(abs(price-o["bot"]),abs(price-o["top"]))/price*100
         if inz:   near_ob=o;osc=3 if o["type"]==tr["direction"] else 1;break
         elif dist<0.4 and not near_ob: near_ob=o;osc=2 if o["type"]==tr["direction"] else 1
-
     vsc=(3 if vol["bias"]==tr["direction"] and vol["vol_surge"] else
          2 if vol["bias"]==tr["direction"] else
          1 if vol["bias"]=="neutral" else 0)
@@ -411,16 +423,13 @@ def analyze(candles, price, htf_trend, funding, oi_info):
               (htf_trend["strong_bull"] or htf_trend["strong_bear"]) else
          1 if htf_trend["direction"]==tr["direction"] else 0)
     base_score=min(10,round((fsc+osc+vsc+tsc+hsc)*10/13))
-
     has_fvg=near_fvg is not None and near_fvg["type"]==tr["direction"]
     has_ob =near_ob  is not None and near_ob["type"]==tr["direction"]
     min_score=MIN_SCORE_DUAL if (has_fvg and has_ob) else MIN_SCORE_SINGLE
-
     bull_ok=(near_fvg and near_fvg["type"]=="bull" and near_ob and near_ob["type"]=="bull"
              and vol["bias"]=="bull" and tr["direction"]=="bull")
     bear_ok=(near_fvg and near_fvg["type"]=="bear" and near_ob and near_ob["type"]=="bear"
              and vol["bias"]=="bear" and tr["direction"]=="bear")
-
     sig="WAIT"
     if base_score>=min_score:
         if bull_ok:   sig="LONG_STRONG"
@@ -431,47 +440,40 @@ def analyze(candles, price, htf_trend, funding, oi_info):
         elif (tr["direction"]=="bear"
               and (near_fvg and near_fvg["type"]=="bear" or near_ob and near_ob["type"]=="bear")
               and vol["bias"] in ("bear","neutral")): sig="SHORT"
-
     if sig not in ("WAIT",):
         mdir="bull" if "LONG" in sig else "bear"
         if not check_momentum(candles,mdir): sig="FILTERED_MOMENTUM"
     if sig not in ("WAIT","FILTERED_MOMENTUM"):
-        if "LONG" in sig  and htf_trend["direction"]=="bear": sig="FILTERED_HTF"
-        if "SHORT" in sig and htf_trend["direction"]=="bull": sig="FILTERED_HTF"
+        if "LONG"  in sig and htf_trend["direction"]=="bear": sig="FILTERED_HTF"
+        if "SHORT" in sig and htf_trend["direction"]=="bull":  sig="FILTERED_HTF"
     if sig not in ("WAIT","FILTERED_MOMENTUM","FILTERED_HTF"):
-        if "LONG" in sig  and funding["long_blocked"]:  sig="FILTERED_FUND"
+        if "LONG"  in sig and funding["long_blocked"]:  sig="FILTERED_FUND"
         if "SHORT" in sig and funding["short_blocked"]: sig="FILTERED_FUND"
-
     if "FILTERED" in sig or sig=="WAIT":
-        return {**WAIT_RESULT,"sig":sig}
+        return {**WAIT_RESULT, "sig":sig, "total":base_score, "base_score":base_score}
 
     # ── RSI 다이버전스 체크 (v12b 핵심)
     is_long_dir = "LONG" in sig
     rsi_direction = "bull" if is_long_dir else "bear"
     rsi_score, rsi_desc = detect_rsi_divergence(candles, rsi_direction)
-    rsi_info = {"score":rsi_score,"desc":rsi_desc,"current_rsi":calc_rsi(candles)}
+    rsi_info = {"score":rsi_score, "desc":rsi_desc, "current_rsi":calc_rsi(candles)}
 
+    # 역다이버전스 → 진입 차단
     if rsi_score == -1:
-        # 역다이버전스 → 진입 차단
-        return {**WAIT_RESULT,"sig":"FILTERED_RSI_DIV","rsi_info":rsi_info}
+        return {**WAIT_RESULT, "sig":"FILTERED_RSI_DIV", "rsi_info":rsi_info,
+                "total":base_score, "base_score":base_score}
 
     # RSI 다이버전스 가산점 적용
     total = min(10, base_score + rsi_score)
 
     is_long="LONG" in sig; strong="STRONG" in sig
     tp_m=ATR_TP_MULT*(1.2 if strong else 1.0)
-
-    # TP1: 50% 익절 기준 (v10 스타일)
-    # TP2: 나머지 50% 전량 익절 (×1.5)
-    # TP3: 참고용 (×2.2)
-    tp1=price+atr*tp_m       if is_long else price-atr*tp_m
-    tp2=price+atr*tp_m*1.5   if is_long else price-atr*tp_m*1.5
-    tp3=price+atr*tp_m*2.2   if is_long else price-atr*tp_m*2.2
-
+    tp1=price+atr*tp_m if is_long else price-atr*tp_m
+    tp2=price+atr*tp_m*1.5 if is_long else price-atr*tp_m*1.5
+    tp3=price+atr*tp_m*2.2 if is_long else price-atr*tp_m*2.2
     sl_atr=price-atr*ATR_SL_MULT if is_long else price+atr*ATR_SL_MULT
-    sl_ob=(near_ob["low"]*0.999  if is_long else near_ob["high"]*1.001) if near_ob else None
+    sl_ob=(near_ob["low"]*0.999 if is_long else near_ob["high"]*1.001) if near_ob else None
     sl_fvg=(near_fvg["bot"]*0.999 if is_long else near_fvg["top"]*1.001) if near_fvg else None
-
     sl_price=sl_atr; sl_basis="ATR"
     for cand,basis in [(sl_ob,"OB"),(sl_fvg,"FVG"),(sl_atr,"ATR")]:
         if cand is None: continue
@@ -481,16 +483,14 @@ def analyze(candles, price, htf_trend, funding, oi_info):
     if calc_rr(price,tp1,sl_price,is_long)<MIN_RR:
         mr=max(abs(tp1-price)/MIN_RR,atr*0.4)
         sl_price=(price-mr) if is_long else (price+mr); sl_basis="RR역산"
-
     sl_dist=abs(price-sl_price)/price*100
     rr1=calc_rr(price,tp1,sl_price,is_long)
     rr2=calc_rr(price,tp2,sl_price,is_long)
     rr3=calc_rr(price,tp3,sl_price,is_long)
-
+    # 레버리지
     if total>=9:   leverage=10; grade="공격적"
     elif total>=8: leverage=7;  grade="중간"
     else:          leverage=5;  grade="보수적"
-
     lev_info={"rec_lev":leverage,"risk_grade":grade}
     tp_profits={}
     loss_usdt=TOTAL_SEED*(0.02 if total>=9 else 0.015 if total>=8 else 0.01)
@@ -509,7 +509,6 @@ def analyze(candles, price, htf_trend, funding, oi_info):
         prof=round(pos*(gp/100),2)
         mp=round(prof/margin*100,1) if margin>0 else 0
         tp_profits[lbl]={"usdt":prof,"margin_pct":mp}
-
     return {"sig":sig,"total":total,"base_score":base_score,"rsi_info":rsi_info,
             "price":price,"is_long":is_long,
             "near_fvg":near_fvg,"near_ob":near_ob,"vol":vol,"trend":tr,
@@ -521,7 +520,7 @@ def analyze(candles, price, htf_trend, funding, oi_info):
             "lev_info":lev_info,"tp_profits":tp_profits}
 
 # ═══════════════════════════════════════
-# 메시지 포맷 (v12b — 부분 익절 안내 추가)
+# 메시지 포맷 (v12b — 부분 익절 안내 + RSI)
 # ═══════════════════════════════════════
 def rr_grade(rr):
     if rr is None: return ""
@@ -541,26 +540,22 @@ def format_msg(result, tf_label, risk_pct, consec_win, consec_lose):
     near_fvg=result["near_fvg"]; near_ob=result["near_ob"]
     vol=result["vol"]; trend=result["trend"]; htf=result["htf_trend"]
     funding=result["funding"]; oi=result["oi_info"]; atr=result["atr"]
-    total=result["total"]; base_score=result.get("base_score",total)
-    rsi_info=result.get("rsi_info",{})
+    total=result["total"]; base_score=result.get("base_score", total)
+    rsi_info=result.get("rsi_info") or _RSI_DEFAULT
     is_long="LONG" in sig; strong="STRONG" in sig
     now=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
     if strong and is_long:   header="🚀 <b>LONG 강한 시그널!</b>"
     elif is_long:            header="🟢 <b>LONG 시그널</b>"
     elif strong:             header="💥 <b>SHORT 강한 시그널!</b>"
     else:                    header="🔴 <b>SHORT 시그널</b>"
-
     tp1_pct=abs(tp1-price)/price*100
     tp2_pct=abs(tp2-price)/price*100
     tp3_pct=abs(tp3-price)/price*100
-    sl_pct =abs(sl-price)/price*100
-
+    sl_pct=abs(sl-price)/price*100
     def profit_str(lbl):
         if not profits.get(lbl): return ""
         p=profits[lbl]
         return f"  → +{p['usdt']:,.1f} USDT (+{p['margin_pct']}%)"
-
     sl_lines=[f"🛑 <b>SL: ${sl:,.1f}</b>  (-{sl_pct:.3f}% / ${abs(price-sl):,.1f})  [{sl_basis}]"]
     shown={round(sl,1)}
     for cv,cn in [(sl_ob,"OB기반"),(sl_fvg,"FVG기반"),(sl_atr,"ATR기반")]:
@@ -569,7 +564,6 @@ def format_msg(result, tf_label, risk_pct, consec_win, consec_lose):
             sl_lines.append(f"   ├ {cn}: ${cv:,.1f}  (-{pct:.3f}%)")
             shown.add(round(cv,1))
     sl_block="\n".join(sl_lines)
-
     if lev:
         lev_icon="🔥" if lev["rec_lev"]>=10 else "⚡" if lev["rec_lev"]>=7 else "🛡️"
         liq=lev["liq_long"] if is_long else lev["liq_short"]
@@ -583,11 +577,9 @@ def format_msg(result, tf_label, risk_pct, consec_win, consec_lose):
         )
     else:
         lev_block="레버리지 계산 불가"
-
     risk_icon="🔥" if risk_pct==RISK_HIGH else "🛡️" if risk_pct==RISK_LOW else "⚡"
     risk_state=(f"{risk_icon} 리스크: {risk_pct*100:.1f}%  "
                 f"(연속WIN {consec_win}회 / 연속LOSE {consec_lose}회)")
-
     if near_fvg:
         inz=near_fvg["bot"]*0.998<=price<=near_fvg["top"]*1.002
         fvg_line=(f"├ {'✅' if near_fvg['type']==('bull' if is_long else 'bear') else '⚠️'} "
@@ -596,7 +588,6 @@ def format_msg(result, tf_label, risk_pct, consec_win, consec_lose):
                   f"(갭 {near_fvg['gap_pct']:.2f}%) {'내부✅' if inz else '근접'}")
     else:
         fvg_line="├ ⚪ FVG: 없음"
-
     if near_ob:
         inz=near_ob["bot"]*0.998<=price<=near_ob["top"]*1.002
         ob_line=(f"├ {'✅' if near_ob['type']==('bull' if is_long else 'bear') else '⚠️'} "
@@ -605,47 +596,42 @@ def format_msg(result, tf_label, risk_pct, consec_win, consec_lose):
                  f"(강도 {near_ob['move_pct']:.2f}%) {'내부✅' if inz else '근접'}")
     else:
         ob_line="├ ⚪ OB: 없음"
-
     surge=" 🔥급증" if vol["vol_surge"] else ""
     vol_icon="✅" if vol["bias"]==("bull" if is_long else "bear") else "⚠️"
     vol_line=f"└ {vol_icon} <b>거래량</b>: 매수{vol['buy_pct']}% 매도{vol['sell_pct']}%{surge}"
-
     # RSI 다이버전스 표시
-    rsi_score=rsi_info.get("score",0)
-    rsi_desc =rsi_info.get("desc","")
-    rsi_cur  =rsi_info.get("current_rsi",50)
-    if rsi_score>=2:
-        rsi_line=f"├ 📈 <b>RSI 다이버전스</b>: {rsi_desc} (현재 RSI:{rsi_cur:.0f}) +{rsi_score}점"
-    elif rsi_score==1:
-        rsi_line=f"├ 〽️ RSI 약한다이버전스: {rsi_desc} (현재 RSI:{rsi_cur:.0f}) +{rsi_score}점"
+    rsi_score = rsi_info.get("score", 0)
+    rsi_desc = rsi_info.get("desc", "")
+    rsi_cur = rsi_info.get("current_rsi", 50)
+    if rsi_score >= 2:
+        rsi_line = f"├ 📈 <b>RSI 다이버전스</b>: {rsi_desc} (현재 RSI:{rsi_cur:.0f}) +{rsi_score}점"
+    elif rsi_score == 1:
+        rsi_line = f"├ 〽️ RSI 약한다이버전스: {rsi_desc} (현재 RSI:{rsi_cur:.0f}) +{rsi_score}점"
     else:
-        rsi_line=f"├ ➖ RSI: 다이버전스 없음 (현재 RSI:{rsi_cur:.0f})"
-
+        rsi_line = f"├ ➖ RSI: 다이버전스 없음 (현재 RSI:{rsi_cur:.0f})"
     trend_txt="상승 HH+HL" if trend["hhhl"] else "하락 LH+LL" if trend["lllh"] else "중립"
     htf_txt="상승✅" if htf["direction"]=="bull" else "하락✅"
     htf_str="강한 " if (htf["strong_bull"] or htf["strong_bear"]) else ""
     fund_icon="✅" if not(funding["long_blocked"] or funding["short_blocked"]) else "⚠️"
     oi_txt={"increasing":"증가📈","decreasing":"감소📉","neutral":"중립➡️"}.get(oi["trend"],"—")
     filled="█"*total+"░"*(10-total)
-    score_detail=f"기본{base_score}+RSI{rsi_score}" if rsi_score>0 else f"{base_score}"
-
-    # 부분 익절 전략 안내 (v12b 신규)
+    score_detail = f"기본{base_score}+RSI{rsi_score}" if rsi_score > 0 else f"{base_score}"
+    # 부분 익절 전략 안내
     partial_tp_block=(
         f"📌 <b>부분 익절 전략 (v12b)</b>\n"
         f"├ TP1 도달 시: <b>50% 익절</b>{profit_str('tp1')}\n"
         f"│  → SL을 <b>진입가(본전)</b>로 이동\n"
         f"└ TP2 도달 시: <b>나머지 50% 전량 익절</b>{profit_str('tp2')}"
     )
-
     return f"""{header}
 ━━━━━━━━━━━━━━━━━━━
 📌 BTCUSDT Perp | ⏱ {tf_label}
 💰 <b>현재가: ${price:,.1f}</b>
 📈 <b>진입 & 목표가</b>
 🟡 진입가: ${price:,.1f}
-🎯 TP1: ${tp1:,.1f}  (+{tp1_pct:.2f}%)  R:R {rr_grade(rr1)} 1:{rr1}  [50% 익절]
-🎯 TP2: ${tp2:,.1f}  (+{tp2_pct:.2f}%)  R:R {rr_grade(rr2)} 1:{rr2}  [50% 익절]
-🎯 TP3: ${tp3:,.1f}  (+{tp3_pct:.2f}%)  R:R {rr_grade(rr3)} 1:{rr3}  [참고]
+🎯 TP1: ${tp1:,.1f}  (+{tp1_pct:.2f}%)  R:R {rr_grade(rr1)} 1:{rr1} [50% 익절]
+🎯 TP2: ${tp2:,.1f}  (+{tp2_pct:.2f}%)  R:R {rr_grade(rr2)} 1:{rr2} [50% 익절]
+🎯 TP3: ${tp3:,.1f}  (+{tp3_pct:.2f}%)  R:R {rr_grade(rr3)} 1:{rr3} [참고]
 📉 <b>손절 라인 (SL)</b>
 {sl_block}
 {partial_tp_block}
@@ -663,13 +649,13 @@ def format_msg(result, tf_label, risk_pct, consec_win, consec_lose):
 ├ 상위추세(4h): {htf_str}{htf_txt} | EMA50: ${htf['ema50']:,}
 ├ {fund_icon} 펀딩비: {funding['rate_pct']:+.4f}% ({funding['status']})
 └ 미결제약정: {oi_txt} ({oi['change_pct']:+.2f}%)
-⚡ 강도: {filled} {total}/10  ({score_detail})
+⚡ 강도: {filled} {total}/10 ({score_detail})
 🕐 {now} KST
 ━━━━━━━━━━━━━━━━━━━
 ⚠️ SL 필수 | TP1 50% 익절 후 SL → 본전""".strip()
 
 # ═══════════════════════════════════════
-# 상태 관리
+# 상태 관리 — state.json 연동
 # ═══════════════════════════════════════
 def get_risk_pct(direction):
     cd=state["cooldown"][direction]
@@ -683,66 +669,83 @@ def can_trade(direction, now_ts):
     month_key=now.strftime("%Y-%m")
     cd=state["cooldown"][direction]
 
-    if now_ts < state.get("global_blocked_until",0):
+    # 3일 연속 손실 전체 차단
+    if now_ts < state.get("global_blocked_until", 0):
         remain=(state["global_blocked_until"]-now_ts)//60
         return False, f"3일연속손실 차단 ({remain}분 남음)"
+
+    # 월간 손실 한도
     if month_key in state["monthly_blocked"]:
         return False, f"월간손실 {MONTHLY_MAX_LOSS_PCT*100:.0f}% 한도 초과"
-    daily_bl=state["daily_blocked"].get(date_key,[])
+
+    # 연속 LOSE 당일 차단
+    daily_bl=state["daily_blocked"].get(date_key, [])
     if direction in daily_bl:
         return False, f"{CONSEC_LOSE_LIMIT}연속 LOSE 당일 차단"
+
+    # 쿨다운
     if now_ts-cd["last_ts"] < cd["cooldown"]:
         remain=(cd["cooldown"]-(now_ts-cd["last_ts"]))//60
         return False, f"쿨다운 {remain}분 남음"
-    dl=state["daily_loss"].get(date_key,0)
+
+    # 일일 손실 한도
+    dl=state["daily_loss"].get(date_key, 0)
     if dl >= TOTAL_SEED*DAILY_MAX_LOSS_PCT:
         return False, f"일일손실 {DAILY_MAX_LOSS_PCT*100:.0f}% 한도 초과"
+
     return True, ""
 
 def mark_signal_sent(direction, now_ts, expected_loss):
     now=datetime.datetime.now()
     date_key=now.strftime("%Y-%m-%d")
     month_key=now.strftime("%Y-%m")
-    cd=state["cooldown"][direction]
-    cd["last_ts"]=now_ts
 
+    # 쿨다운 갱신
+    state["cooldown"][direction]["last_ts"]=now_ts
+
+    # 예상 손실 누적
     if date_key not in state["daily_loss"]:
         state["daily_loss"][date_key]=0
     state["daily_loss"][date_key]+=expected_loss
 
+    # 일일 한도 체크
     if state["daily_loss"][date_key] >= TOTAL_SEED*DAILY_MAX_LOSS_PCT:
         if date_key not in state["daily_blocked"]:
             state["daily_blocked"][date_key]=[]
         if direction not in state["daily_blocked"][date_key]:
             state["daily_blocked"][date_key].append(direction)
 
+    # 월간 한도 체크
     monthly_total=sum(v for k,v in state["daily_loss"].items() if k.startswith(month_key))
     if monthly_total >= TOTAL_SEED*MONTHLY_MAX_LOSS_PCT:
         if month_key not in state["monthly_blocked"]:
             state["monthly_blocked"].append(month_key)
             send_telegram(f"⛔ <b>월간손실 {MONTHLY_MAX_LOSS_PCT*100:.0f}% 한도 도달</b>\n이번 달 거래가 중단됩니다.")
 
-    if "daily_had_loss" not in state: state["daily_had_loss"]={}
-    state["daily_had_loss"][date_key]=True
-    dates_loss=sorted([d for d,v in state["daily_had_loss"].items() if v])
-    if len(dates_loss)>=3:
-        last3=dates_loss[-3:]
+    # 3일 연속 손실 감지
+    state["daily_had_loss"][date_key] = True
+    dates_loss = sorted([d for d, v in state["daily_had_loss"].items() if v])
+    if len(dates_loss) >= 3:
+        last3 = dates_loss[-3:]
         try:
-            d1=datetime.datetime.strptime(last3[0],"%Y-%m-%d")
-            d2=datetime.datetime.strptime(last3[1],"%Y-%m-%d")
-            d3=datetime.datetime.strptime(last3[2],"%Y-%m-%d")
-            if (d2-d1).days==1 and (d3-d2).days==1:
-                state["global_blocked_until"]=now_ts+24*3600
+            d1 = datetime.datetime.strptime(last3[0], "%Y-%m-%d")
+            d2 = datetime.datetime.strptime(last3[1], "%Y-%m-%d")
+            d3 = datetime.datetime.strptime(last3[2], "%Y-%m-%d")
+            if (d2 - d1).days == 1 and (d3 - d2).days == 1:
+                state["global_blocked_until"] = now_ts + 24 * 3600
                 print(f"  ⛔ 3일 연속 손실 → 24h 전체 거래 차단")
                 send_telegram("⛔ <b>3일 연속 손실 감지</b>\n24시간 전체 거래 차단됩니다.")
-        except: pass
+        except:
+            pass
 
+    # 시그널 기록
     state["signals_sent"].append({
-        "ts":now_ts,"direction":direction,
-        "date":date_key,"expected_loss":expected_loss
+        "ts":now_ts, "direction":direction,
+        "date":date_key, "expected_loss":expected_loss
     })
     if len(state["signals_sent"])>100:
         state["signals_sent"]=state["signals_sent"][-100:]
+
     save_state()
 
 # ═══════════════════════════════════════
@@ -781,67 +784,57 @@ def run():
         f"💰 부분 익절: TP1 50% + SL본전 이동 → TP2 전량\n"
         f"⚡ 켈리 리스크: {RISK_LOW*100:.0f}%/{RISK_BASE*100:.0f}%/{RISK_HIGH*100:.0f}%\n"
         f"⏱ 쿨다운: 2h | 연속LOSE {CONSEC_LOSE_LIMIT}회 차단\n\n"
-        f"📈 백테스팅: 승률 40.7% | EV +0.468 | +371.9%\n"
         "FVG + OB + RSI다이버전스 + 변동성 필터 분석 중..."
     )
 
     htf_candles=[]; htf_last_upd=0; cycle=0
-
     while True:
         cycle+=1
         now_str=datetime.datetime.now().strftime("%H:%M:%S")
         now_ts=int(time.time())
         print(f"\n[{now_str}] 사이클 #{cycle}")
-
         try:
             ticker=get_ticker()
             price=float(ticker["lastPrice"])
             chg=float(ticker["price24hPcnt"])*100
             print(f"  현재가: ${price:,.1f} ({chg:+.2f}%)")
-
             fund_raw=get_funding_rate()
             funding=check_funding(fund_raw)
             print(f"  펀딩비: {funding['rate_pct']:+.4f}% ({funding['status']})")
-
             oi_hist=get_oi_history()
             oi_info=check_oi_trend(oi_hist)
-
             if now_ts-htf_last_upd>300:
                 htf_candles=get_klines(HTF,limit=200)
                 htf_last_upd=now_ts
             htf_trend=check_htf_trend(htf_candles) if htf_candles else {
                 "direction":"bull","strength":1,"ema50":0,"ema200":0,
                 "strong_bull":False,"strong_bear":False,"hhhl":False,"lllh":False}
-
             for tf in TIMEFRAMES:
                 tf_label=TF_LABEL[tf]
                 try:
                     candles=get_klines(tf,limit=200)
                     if not candles:
-                        print(f"  [{TF_LABEL[tf]}] 캔들 데이터 없음 — 스킵")
+                        print(f"  [{tf_label}] 캔들 데이터 없음 — 스킵")
                         time.sleep(0.5); continue
                     result=analyze(candles,price,htf_trend,funding,oi_info)
                     if result is None:
-                        print(f"  [{TF_LABEL[tf]}] analyze 반환값 없음 — 스킵")
+                        print(f"  [{tf_label}] analyze 반환값 없음 — 스킵")
                         time.sleep(0.5); continue
                     sig=result["sig"]
-
                     if sig in ("WAIT","FILTERED_MOMENTUM","FILTERED_HTF",
                                "FILTERED_FUND","FILTERED_VOL","FILTERED_RSI_DIV"):
-                        rsi_cur=result.get("rsi_info",{}).get("current_rsi",0)
-                        rsi_extra=f" (RSI역다이버전스 차단)" if sig=="FILTERED_RSI_DIV" else ""
+                        rsi_extra = " (RSI역다이버전스)" if sig == "FILTERED_RSI_DIV" else ""
                         print(f"  [{tf_label}] {sig}{rsi_extra}")
                         time.sleep(0.5); continue
-
                     direction="LONG" if "LONG" in sig else "SHORT"
                     ok,reason=can_trade(direction,now_ts)
-
-                    rsi_s=result.get("rsi_info",{}).get("score",0)
-                    lev_txt=f" LEV:{result['lev_info']['rec_lev']}x" if result.get("lev_info") else ""
-                    rsi_txt=f" RSI+{rsi_s}" if rsi_s>0 else ""
+                    rsi_s = (result.get("rsi_info") or _RSI_DEFAULT).get("score", 0)
+                    lev_txt=""
+                    if result.get("lev_info"):
+                        lev_txt=f" LEV:{result['lev_info']['rec_lev']}x"
+                    rsi_txt=f" RSI+{rsi_s}" if rsi_s > 0 else ""
                     print(f"  [{tf_label}] {sig:15s} 점수:{result['total']}/10{lev_txt}{rsi_txt}"
                           +(f" → 차단: {reason}" if not ok else ""))
-
                     if ok and result["rr1"] and result["rr1"]>=MIN_RR:
                         risk_pct=get_risk_pct(direction)
                         cd=state["cooldown"][direction]
@@ -851,14 +844,11 @@ def run():
                             expected_loss=result["lev_info"]["loss_usdt"] if result.get("lev_info") else 0
                             mark_signal_sent(direction,now_ts,expected_loss)
                             print(f"  ✅ [{tf_label}] 전송 완료!")
-
                     time.sleep(0.5)
                 except Exception as e:
                     print(f"  ⚠️ [{tf_label}] 오류: {e}")
-
         except Exception as e:
             print(f"  ❌ 오류: {e}")
-
         print(f"  → {CHECK_INTERVAL}초 후 재실행...")
         time.sleep(CHECK_INTERVAL)
 
