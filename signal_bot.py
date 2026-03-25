@@ -9,6 +9,7 @@ v12b 변경사항 (v6.1 대비):
 ③ 변동성 필터 (ATR 기반 횡보장 필터링)
 ④ TP/SL 조정: MIN_RR=1.5, ATR_TP=2.0, ATR_SL=1.3
 ⑤ 3일 연속 손실 시 24h 전체 차단
+⑥ 차단 중에도 참고용 시그널 텔레그램 전송 (수동매매 참고)
 
 보안: 텔레그램 토큰 → 환경변수
 상태 영속화: state.json (재시작 시 복원)
@@ -217,23 +218,13 @@ def calc_rsi_series(cs, p=14):
     return result
 
 def detect_rsi_divergence(cs, direction):
-    """
-    RSI 다이버전스 감지
-    반환: (점수, 설명문자열)
-      +2: 강한 다이버전스
-      +1: 약한 다이버전스
-       0: 없음
-      -1: 역다이버전스 → 진입 차단
-    """
     lookback = RSI_DIV_LOOKBACK
     if len(cs) < lookback + RSI_PERIOD:
         return 0, ""
-
     rsi_series = calc_rsi_series(cs, RSI_PERIOD)
     lows = [c["low"] for c in cs]
     highs = [c["high"] for c in cs]
     n = len(cs) - 1
-
     if direction == "bull":
         price_lows = []
         for i in range(n - lookback, n - 1):
@@ -262,7 +253,6 @@ def detect_rsi_divergence(cs, direction):
             return 1, f"약한약세다이버전스 RSI:{p2[2]:.0f}"
         if p2[1] > p1[1] * 1.005 and p2[2] > p1[2] + 2 and p2[2] > 65:
             return -1, f"역다이버전스(SHORT차단) RSI:{p2[2]:.0f}"
-
     return 0, ""
 
 # ═══════════════════════════════════════
@@ -379,7 +369,6 @@ def check_momentum(cs, direction):
     if len(cs)<2: return True
     return cs[-1]["bull"] if direction=="bull" else not cs[-1]["bull"]
 
-# WAIT/FILTERED 반환용 기본값 (rsi_info를 빈 dict가 아닌 기본값으로 설정)
 _RSI_DEFAULT = {"score":0, "desc":"", "current_rsi":50.0}
 
 def analyze(candles, price, htf_trend, funding, oi_info):
@@ -387,7 +376,6 @@ def analyze(candles, price, htf_trend, funding, oi_info):
                    "tp1":None,"tp2":None,"tp3":None,"sl":None,
                    "rr1":None,"rr2":None,"rr3":None,"sl_basis":None,
                    "lev_info":None,"tp_profits":{},"rsi_info":_RSI_DEFAULT}
-
     if not candles or len(candles) < 30:
         return {**WAIT_RESULT, "sig":"WAIT"}
     if not htf_trend or not isinstance(htf_trend, dict):
@@ -396,11 +384,8 @@ def analyze(candles, price, htf_trend, funding, oi_info):
         return {**WAIT_RESULT, "sig":"WAIT"}
     if not oi_info or not isinstance(oi_info, dict):
         return {**WAIT_RESULT, "sig":"WAIT"}
-
-    # 변동성 필터
     if not check_volatility(candles):
         return {**WAIT_RESULT, "sig":"FILTERED_VOL"}
-
     atr=calc_atr(candles); fvgs=detect_fvg(candles)
     obs=detect_ob(candles); vol=analyze_volume(candles); tr=detect_trend(candles)
     near_fvg,fsc=None,0
@@ -451,21 +436,14 @@ def analyze(candles, price, htf_trend, funding, oi_info):
         if "SHORT" in sig and funding["short_blocked"]: sig="FILTERED_FUND"
     if "FILTERED" in sig or sig=="WAIT":
         return {**WAIT_RESULT, "sig":sig, "total":base_score, "base_score":base_score}
-
-    # ── RSI 다이버전스 체크 (v12b 핵심)
     is_long_dir = "LONG" in sig
     rsi_direction = "bull" if is_long_dir else "bear"
     rsi_score, rsi_desc = detect_rsi_divergence(candles, rsi_direction)
     rsi_info = {"score":rsi_score, "desc":rsi_desc, "current_rsi":calc_rsi(candles)}
-
-    # 역다이버전스 → 진입 차단
     if rsi_score == -1:
         return {**WAIT_RESULT, "sig":"FILTERED_RSI_DIV", "rsi_info":rsi_info,
                 "total":base_score, "base_score":base_score}
-
-    # RSI 다이버전스 가산점 적용
     total = min(10, base_score + rsi_score)
-
     is_long="LONG" in sig; strong="STRONG" in sig
     tp_m=ATR_TP_MULT*(1.2 if strong else 1.0)
     tp1=price+atr*tp_m if is_long else price-atr*tp_m
@@ -487,7 +465,6 @@ def analyze(candles, price, htf_trend, funding, oi_info):
     rr1=calc_rr(price,tp1,sl_price,is_long)
     rr2=calc_rr(price,tp2,sl_price,is_long)
     rr3=calc_rr(price,tp3,sl_price,is_long)
-    # 레버리지
     if total>=9:   leverage=10; grade="공격적"
     elif total>=8: leverage=7;  grade="중간"
     else:          leverage=5;  grade="보수적"
@@ -599,7 +576,6 @@ def format_msg(result, tf_label, risk_pct, consec_win, consec_lose):
     surge=" 🔥급증" if vol["vol_surge"] else ""
     vol_icon="✅" if vol["bias"]==("bull" if is_long else "bear") else "⚠️"
     vol_line=f"└ {vol_icon} <b>거래량</b>: 매수{vol['buy_pct']}% 매도{vol['sell_pct']}%{surge}"
-    # RSI 다이버전스 표시
     rsi_score = rsi_info.get("score", 0)
     rsi_desc = rsi_info.get("desc", "")
     rsi_cur = rsi_info.get("current_rsi", 50)
@@ -616,7 +592,6 @@ def format_msg(result, tf_label, risk_pct, consec_win, consec_lose):
     oi_txt={"increasing":"증가📈","decreasing":"감소📉","neutral":"중립➡️"}.get(oi["trend"],"—")
     filled="█"*total+"░"*(10-total)
     score_detail = f"기본{base_score}+RSI{rsi_score}" if rsi_score > 0 else f"{base_score}"
-    # 부분 익절 전략 안내
     partial_tp_block=(
         f"📌 <b>부분 익절 전략 (v12b)</b>\n"
         f"├ TP1 도달 시: <b>50% 익절</b>{profit_str('tp1')}\n"
@@ -668,61 +643,40 @@ def can_trade(direction, now_ts):
     date_key=now.strftime("%Y-%m-%d")
     month_key=now.strftime("%Y-%m")
     cd=state["cooldown"][direction]
-
-    # 3일 연속 손실 전체 차단
     if now_ts < state.get("global_blocked_until", 0):
         remain=(state["global_blocked_until"]-now_ts)//60
         return False, f"3일연속손실 차단 ({remain}분 남음)"
-
-    # 월간 손실 한도
     if month_key in state["monthly_blocked"]:
         return False, f"월간손실 {MONTHLY_MAX_LOSS_PCT*100:.0f}% 한도 초과"
-
-    # 연속 LOSE 당일 차단
     daily_bl=state["daily_blocked"].get(date_key, [])
     if direction in daily_bl:
         return False, f"{CONSEC_LOSE_LIMIT}연속 LOSE 당일 차단"
-
-    # 쿨다운
     if now_ts-cd["last_ts"] < cd["cooldown"]:
         remain=(cd["cooldown"]-(now_ts-cd["last_ts"]))//60
         return False, f"쿨다운 {remain}분 남음"
-
-    # 일일 손실 한도
     dl=state["daily_loss"].get(date_key, 0)
     if dl >= TOTAL_SEED*DAILY_MAX_LOSS_PCT:
         return False, f"일일손실 {DAILY_MAX_LOSS_PCT*100:.0f}% 한도 초과"
-
     return True, ""
 
 def mark_signal_sent(direction, now_ts, expected_loss):
     now=datetime.datetime.now()
     date_key=now.strftime("%Y-%m-%d")
     month_key=now.strftime("%Y-%m")
-
-    # 쿨다운 갱신
     state["cooldown"][direction]["last_ts"]=now_ts
-
-    # 예상 손실 누적
     if date_key not in state["daily_loss"]:
         state["daily_loss"][date_key]=0
     state["daily_loss"][date_key]+=expected_loss
-
-    # 일일 한도 체크
     if state["daily_loss"][date_key] >= TOTAL_SEED*DAILY_MAX_LOSS_PCT:
         if date_key not in state["daily_blocked"]:
             state["daily_blocked"][date_key]=[]
         if direction not in state["daily_blocked"][date_key]:
             state["daily_blocked"][date_key].append(direction)
-
-    # 월간 한도 체크
     monthly_total=sum(v for k,v in state["daily_loss"].items() if k.startswith(month_key))
     if monthly_total >= TOTAL_SEED*MONTHLY_MAX_LOSS_PCT:
         if month_key not in state["monthly_blocked"]:
             state["monthly_blocked"].append(month_key)
             send_telegram(f"⛔ <b>월간손실 {MONTHLY_MAX_LOSS_PCT*100:.0f}% 한도 도달</b>\n이번 달 거래가 중단됩니다.")
-
-    # 3일 연속 손실 감지
     state["daily_had_loss"][date_key] = True
     dates_loss = sorted([d for d, v in state["daily_had_loss"].items() if v])
     if len(dates_loss) >= 3:
@@ -737,15 +691,12 @@ def mark_signal_sent(direction, now_ts, expected_loss):
                 send_telegram("⛔ <b>3일 연속 손실 감지</b>\n24시간 전체 거래 차단됩니다.")
         except:
             pass
-
-    # 시그널 기록
     state["signals_sent"].append({
         "ts":now_ts, "direction":direction,
         "date":date_key, "expected_loss":expected_loss
     })
     if len(state["signals_sent"])>100:
         state["signals_sent"]=state["signals_sent"][-100:]
-
     save_state()
 
 # ═══════════════════════════════════════
@@ -761,6 +712,7 @@ def run():
     print(f"  부분 익절: TP1 50% + SL본전 → TP2 전량")
     print(f"  리스크: {RISK_LOW*100:.0f}%/{RISK_BASE*100:.0f}%/{RISK_HIGH*100:.0f}% (켈리)")
     print(f"  연속LOSE {CONSEC_LOSE_LIMIT}회 차단 | 일{DAILY_MAX_LOSS_PCT*100:.0f}% | 월{MONTHLY_MAX_LOSS_PCT*100:.0f}%")
+    print(f"  차단 중 참고용 시그널: 텔레그램 전송 (수동매매 참고)")
     print("="*62)
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -783,7 +735,8 @@ def run():
         f"📈 RSI 다이버전스: 강한신호 +2점 / 역다이버전스 차단\n"
         f"💰 부분 익절: TP1 50% + SL본전 이동 → TP2 전량\n"
         f"⚡ 켈리 리스크: {RISK_LOW*100:.0f}%/{RISK_BASE*100:.0f}%/{RISK_HIGH*100:.0f}%\n"
-        f"⏱ 쿨다운: 2h | 연속LOSE {CONSEC_LOSE_LIMIT}회 차단\n\n"
+        f"⏱ 쿨다운: 2h | 연속LOSE {CONSEC_LOSE_LIMIT}회 차단\n"
+        f"👁 차단 중 참고용 시그널 전송 활성화\n\n"
         "FVG + OB + RSI다이버전스 + 변동성 필터 분석 중..."
     )
 
@@ -835,15 +788,20 @@ def run():
                     rsi_txt=f" RSI+{rsi_s}" if rsi_s > 0 else ""
                     print(f"  [{tf_label}] {sig:15s} 점수:{result['total']}/10{lev_txt}{rsi_txt}"
                           +(f" → 차단: {reason}" if not ok else ""))
-                    if ok and result["rr1"] and result["rr1"]>=MIN_RR:
+                    if result["rr1"] and result["rr1"]>=MIN_RR:
                         risk_pct=get_risk_pct(direction)
                         cd=state["cooldown"][direction]
                         msg=format_msg(result,tf_label,risk_pct,
                                        cd["consec_win"],cd["consec_lose"])
-                        if send_telegram(msg):
-                            expected_loss=result["lev_info"]["loss_usdt"] if result.get("lev_info") else 0
-                            mark_signal_sent(direction,now_ts,expected_loss)
-                            print(f"  ✅ [{tf_label}] 전송 완료!")
+                        if ok:
+                            if send_telegram(msg):
+                                expected_loss=result["lev_info"]["loss_usdt"] if result.get("lev_info") else 0
+                                mark_signal_sent(direction,now_ts,expected_loss)
+                                print(f"  ✅ [{tf_label}] 전송 완료!")
+                        else:
+                            ref_msg=f"👁 <b>[참고용 — 자동매매 차단 중]</b>\n⚠️ 사유: {reason}\n\n{msg}"
+                            if send_telegram(ref_msg):
+                                print(f"  👁 [{tf_label}] 참고용 전송 (차단: {reason})")
                     time.sleep(0.5)
                 except Exception as e:
                     print(f"  ⚠️ [{tf_label}] 오류: {e}")
